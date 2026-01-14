@@ -66,4 +66,5 @@ public class FieldValidation
     public int Offset { get; set; }
     public string Type { get; set; } = "";
     public int Size { get; set; }
+    public string? Value { get; set; }
 }

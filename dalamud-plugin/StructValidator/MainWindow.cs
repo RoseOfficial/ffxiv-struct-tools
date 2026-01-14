@@ -361,18 +361,19 @@ public class MainWindow : Window, IDisposable
             ImGui.TextColored(new Vector4(0.5f, 1, 0.5f, 1), "No issues found.");
         }
 
-        // Field validations
+        // Field validations - now showing live values from game memory
         if (result.FieldValidations != null && result.FieldValidations.Count > 0)
         {
             ImGui.Separator();
-            ImGui.Text($"Field Validations ({result.FieldValidations.Count}):");
+            ImGui.Text($"Fields ({result.FieldValidations.Count}):");
 
-            if (ImGui.BeginTable("FieldsTable", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg))
+            if (ImGui.BeginTable("FieldsTable", 5, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable))
             {
-                ImGui.TableSetupColumn("Name");
-                ImGui.TableSetupColumn("Offset");
-                ImGui.TableSetupColumn("Type");
-                ImGui.TableSetupColumn("Size");
+                ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.None, 150);
+                ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.None, 60);
+                ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.None, 80);
+                ImGui.TableSetupColumn("Size", ImGuiTableColumnFlags.None, 40);
+                ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.None, 150);
                 ImGui.TableHeadersRow();
 
                 foreach (var field in result.FieldValidations)
@@ -385,7 +386,9 @@ public class MainWindow : Window, IDisposable
                     ImGui.TableNextColumn();
                     ImGui.Text(field.Type);
                     ImGui.TableNextColumn();
-                    ImGui.Text($"0x{field.Size:X}");
+                    ImGui.Text($"{field.Size}");
+                    ImGui.TableNextColumn();
+                    ImGui.Text(field.Value ?? "");
                 }
 
                 ImGui.EndTable();
