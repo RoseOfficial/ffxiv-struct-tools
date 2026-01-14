@@ -51,15 +51,253 @@ fst validate ./ida/ffxiv_structs.yml --ignore struct-size,field-bounds
 | `vfunc-id` | warning | Virtual function IDs should be in reasonable range |
 | `func-address` | info | Function addresses should be in valid range |
 | `duplicate-offset` | info | Fields at same offset may indicate union |
+| `inheritance-chain` | warning/error | Base struct must exist, no self-inheritance |
+| `vtable-consistency` | error/info | VFunc IDs should not duplicate, gaps are noted |
+| `pointer-alignment` | warning | Pointer fields should be 8-byte aligned (strict only) |
+| `size-field-mismatch` | error/info | Declared size must fit all fields, large gaps noted (strict) |
+| `naming-convention` | info | PascalCase for structs/fields (strict only) |
 | `enum-name` | error | Enum must have a type/name |
 | `enum-duplicate-value` | info | Enum values with same number |
 
+### `fst diff`
+
+Compare struct definitions between versions and detect bulk offset patterns.
+
+```bash
+# Compare two versions
+fst diff old-version.yaml new-version.yaml
+
+# Enable pattern detection (bulk shifts, vtable changes)
+fst diff old-version.yaml new-version.yaml --detect-patterns
+
+# Output as JSON
+fst diff old-version.yaml new-version.yaml --json
+
+# Compare directories with glob patterns
+fst diff "./old/*.yml" "./new/*.yml"
+
+# Show only struct changes
+fst diff old.yaml new.yaml --structs-only
+```
+
+**Features:**
+- Detects added, removed, and modified structs/enums
+- Identifies bulk offset shift patterns (e.g., "all fields +0x8 after offset 0x100")
+- Detects vtable slot shifts
+- Reports confidence scores for detected patterns
+
+### `fst patch`
+
+Apply bulk offset changes to YAML files.
+
+```bash
+# Apply offset shift (dry-run to preview)
+fst patch ./structs.yaml --delta 0x8 --start-offset 0x100 --dry-run
+
+# Apply to specific structs
+fst patch ./structs.yaml --delta 0x8 --struct "PlayerCharacter"
+
+# Apply vtable slot shift
+fst patch ./structs.yaml --vfunc-delta 2 --struct "Actor*"
+
+# Apply changes (writes to file)
+fst patch ./structs.yaml --delta 0x8 --start-offset 0x100
+
+# Apply a patch file
+fst patch ./structs.yaml --apply patch.json
+```
+
+**Options:**
+- `--delta <offset>` - Offset delta to apply (e.g., 0x8, +8, -0x10)
+- `--start-offset <offset>` - Only shift offsets >= this value
+- `--struct <pattern>` - Struct name pattern (supports `*` wildcard)
+- `--vfunc-delta <n>` - VFunc slot delta to apply
+- `--dry-run` - Preview changes without writing
+
+### `fst export`
+
+Export struct definitions to various reverse engineering tool formats.
+
+```bash
+# Export to IDA Pro Python script
+fst export ./structs.yaml --format ida
+
+# Export to ReClass.NET XML
+fst export ./structs.yaml --format reclass
+
+# Export to C/C++ header file
+fst export ./structs.yaml --format headers
+
+# Export to Ghidra Python script
+fst export ./structs.yaml --format ghidra
+
+# Specify output path
+fst export ./structs.yaml --format ida --output ./output/ffxiv_types.py
+
+# Export multiple files
+fst export "./ida/*.yml" --format headers --output ./ffxiv_all.h
+
+# Custom namespace for headers/Ghidra
+fst export ./structs.yaml --format headers --namespace FFXIV::Client
+```
+
+**Supported Formats:**
+
+| Format | Extension | Description |
+|--------|-----------|-------------|
+| `ida` | `.py` | IDA Pro Python script - creates structs/enums in IDA |
+| `reclass` | `.reclass` | ReClass.NET XML - import into ReClass memory viewer |
+| `headers` | `.h` | C/C++ header - `#pragma pack(1)` structs with `static_assert` |
+| `ghidra` | `.py` | Ghidra Python script - creates data types in Ghidra |
+
+**Options:**
+- `-f, --format <type>` - Output format (required): ida, reclass, headers, ghidra
+- `-o, --output <path>` - Output file path
+- `-n, --namespace <name>` - Namespace/category for generated types
+- `-c, --comments` - Include comments in output
+
+### `fst test`
+
+Run comprehensive validation tests with CI integration and baseline comparison.
+
+```bash
+# Run tests on YAML files
+fst test ./ida/ffxiv_structs.yml
+
+# Enable strict mode for additional checks
+fst test ./ida/ffxiv_structs.yml --strict
+
+# Fail on warnings (useful for CI)
+fst test ./ida/ffxiv_structs.yml --fail-on-warning
+
+# Compare against a baseline file
+fst test ./ida/ffxiv_structs.yml --baseline ./baseline.json
+
+# Update baseline with current results
+fst test ./ida/ffxiv_structs.yml --baseline ./baseline.json --update-baseline
+
+# Output as JSON for CI tools
+fst test ./ida/ffxiv_structs.yml --json
+
+# Write report to file
+fst test ./ida/ffxiv_structs.yml --output ./report.json
+```
+
+**Options:**
+- `-b, --baseline <path>` - Compare against baseline file (shows new/resolved issues)
+- `-u, --update-baseline` - Update baseline file with current results
+- `--strict` - Enable strict mode with additional checks
+- `--fail-on-warning` - Exit with error code on warnings
+- `--json` - Output results as JSON
+- `-o, --output <path>` - Write test report to file
+
+**CI Integration Example:**
+```yaml
+# GitHub Actions
+- name: Validate struct definitions
+  run: fst test ./ida/*.yml --strict --fail-on-warning
+```
+
+### `fst compare-report`
+
+Compare YAML definitions with Dalamud validation reports exported from the in-game plugin.
+
+```bash
+# Compare YAML with Dalamud validation report
+fst compare-report ./ida/ffxiv_structs.yml ./struct-validation.json
+
+# Output as JSON
+fst compare-report ./ida/*.yml ./validation.json --json
+
+# Save comparison report
+fst compare-report ./ida/*.yml ./validation.json -o ./comparison.json
+```
+
+**Options:**
+- `--json` - Output results as JSON
+- `-o, --output <path>` - Write comparison report to file
+
+### `fst report`
+
+Generate documentation and reports from YAML definitions.
+
+```bash
+# Generate markdown documentation
+fst report ./ida/ffxiv_structs.yml
+
+# Generate HTML documentation
+fst report ./ida/ffxiv_structs.yml --format html
+
+# Generate JSON report
+fst report ./ida/ffxiv_structs.yml --format json
+
+# Include relationship graph (Mermaid diagrams)
+fst report ./ida/ffxiv_structs.yml --graph
+
+# Generate changelog by comparing versions
+fst report ./new-version.yml --changelog ./old-version.yml
+
+# Filter by struct name
+fst report ./ida/ffxiv_structs.yml --struct PlayerCharacter
+
+# Filter by category
+fst report ./ida/ffxiv_structs.yml --category Combat
+
+# Write to file
+fst report ./ida/ffxiv_structs.yml -o ./docs/structs.md
+```
+
+**Options:**
+- `-f, --format <type>` - Output format: markdown (default), html, json
+- `-o, --output <path>` - Output file path
+- `-s, --struct <name>` - Filter to specific struct
+- `-c, --category <name>` - Filter by category
+- `-g, --graph` - Include relationship graph (Mermaid format)
+- `--changelog <old-files>` - Generate changelog comparing with old version
+- `-d, --depth <n>` - Relationship graph depth (default: 2)
+- `-t, --title <title>` - Custom report title
+
+**Features:**
+- Generates comprehensive markdown/HTML documentation
+- Struct relationship graphs using Mermaid diagrams
+- Changelog generation showing added/removed/modified structs
+- Category-based organization
+- Field and function documentation with notes support
+
+### YAML Annotations
+
+Struct definitions support `notes` and `category` fields for better documentation:
+
+```yaml
+structs:
+  - type: PlayerCharacter
+    size: 0x1A70
+    category: Character
+    notes: |
+      Main player character struct.
+      Handles position, stats, and animations.
+    fields:
+      - type: int
+        name: Level
+        offset: 0x18
+        notes: Current job level (1-100)
+```
+
+When using `--comments` with `fst export`, these notes are included in the generated output.
+
+## Dalamud Plugin
+
+The `dalamud-plugin/` directory contains a Dalamud plugin for in-game struct validation. This plugin:
+
+- Validates FFXIVClientStructs definitions against live game memory
+- Detects size mismatches and field offset errors
+- Exports JSON reports for use with `fst compare-report`
+
+See [dalamud-plugin/README.md](./dalamud-plugin/README.md) for installation and usage instructions.
+
 ### Coming Soon
 
-- `fst diff` - Compare struct definitions between versions
-- `fst patch` - Generate and apply offset patches
 - `fst vtables` - Track vtable addresses across game versions
-- `fst export` - Export definitions to IDA/ReClass/header formats
 
 ## Development
 

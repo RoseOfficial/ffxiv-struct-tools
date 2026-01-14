@@ -1,0 +1,16 @@
+{
+  "Name": "Struct Validator",
+  "Author": "ffxiv-struct-tools",
+  "Punchline": "Validate FFXIVClientStructs definitions against live game memory",
+  "Description": "A development tool for FFXIVClientStructs maintainers that validates struct definitions against actual game memory. Detects size mismatches, field offset errors, and inheritance issues.",
+  "RepoUrl": "https://github.com/YOUR_USERNAME/ffxiv-struct-tools",
+  "Tags": [
+    "development",
+    "debugging",
+    "structs"
+  ],
+  "CategoryTags": [
+    "devTools"
+  ],
+  "DalamudApiLevel": 10
+}

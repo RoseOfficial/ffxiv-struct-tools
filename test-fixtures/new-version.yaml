@@ -1,0 +1,62 @@
+structs:
+  - type: PlayerCharacter
+    size: 0x1A80
+    fields:
+      - type: byte
+        name: Flags
+        offset: 0x10
+      - type: int
+        name: Level
+        offset: 0x20
+      - type: int
+        name: Experience
+        offset: 0x24
+      - type: int
+        name: JobLevel
+        offset: 0x28
+      - type: Utf8String
+        name: Name
+        offset: 0x58
+      - type: Vector3
+        name: Position
+        offset: 0xC0
+    vfuncs:
+      - name: Update
+        id: 7
+      - name: Draw
+        id: 8
+      - name: Destroy
+        id: 9
+
+  - type: ActionManager
+    size: 0x810
+    fields:
+      - type: int
+        name: CurrentAction
+        offset: 0x18
+      - type: float
+        name: AnimationTime
+        offset: 0x1C
+      - type: Pointer<Action>
+        name: QueuedAction
+        offset: 0x20
+      - type: bool
+        name: IsQueued
+        offset: 0x28
+
+  - type: NewStruct
+    size: 0x100
+    fields:
+      - type: int
+        name: Value
+        offset: 0x0
+
+enums:
+  - type: JobType
+    underlying: byte
+    values:
+      None: 0
+      Gladiator: 1
+      Pugilist: 2
+      Marauder: 3
+      Lancer: 4

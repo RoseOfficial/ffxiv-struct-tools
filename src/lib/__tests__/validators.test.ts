@@ -7,6 +7,11 @@ import {
   validateDuplicateOffsets,
   validateEnumValues,
   validateEnumName,
+  validateInheritanceChain,
+  validateVTableConsistency,
+  validatePointerAlignment,
+  validateSizeFieldMismatch,
+  validateNamingConvention,
 } from '../validators.js';
 import type { YamlStruct, YamlEnum } from '../types.js';
 
@@ -209,5 +214,261 @@ describe('validateEnumValues', () => {
     expect(issues).toHaveLength(1);
     expect(issues[0].severity).toBe('info');
     expect(issues[0].rule).toBe('enum-duplicate-value');
+  });
+});
+
+// ============================================================================
+// New Phase 3 Validators
+// ============================================================================
+
+describe('validateInheritanceChain', () => {
+  it('should pass when struct has no base', () => {
+    const struct: YamlStruct = { type: 'TestStruct', size: 16 };
+    const issues = validateInheritanceChain(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass when base struct exists', () => {
+    const context = {
+      allStructNames: new Set(['BaseStruct']),
+      allEnumNames: new Set<string>(),
+      options: {},
+    };
+    const struct: YamlStruct = { type: 'DerivedStruct', size: 32, base: 'BaseStruct' };
+    const issues = validateInheritanceChain(struct, context);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should warn when base struct does not exist', () => {
+    const struct: YamlStruct = { type: 'DerivedStruct', size: 32, base: 'MissingBase' };
+    const issues = validateInheritanceChain(struct, defaultContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('warning');
+    expect(issues[0].rule).toBe('inheritance-chain');
+    expect(issues[0].message).toContain('MissingBase');
+  });
+
+  it('should error on self-inheritance', () => {
+    const struct: YamlStruct = { type: 'SelfRef', size: 16, base: 'SelfRef' };
+    const issues = validateInheritanceChain(struct, defaultContext);
+    expect(issues.some(i => i.severity === 'error')).toBe(true);
+    expect(issues[0].rule).toBe('inheritance-chain');
+  });
+});
+
+describe('validateVTableConsistency', () => {
+  it('should pass when struct has no vfuncs', () => {
+    const struct: YamlStruct = { type: 'TestStruct', size: 16 };
+    const issues = validateVTableConsistency(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass for sequential vfunc IDs', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      vfuncs: [
+        { name: 'Func1', id: 0 },
+        { name: 'Func2', id: 1 },
+        { name: 'Func3', id: 2 },
+      ],
+    };
+    const issues = validateVTableConsistency(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should error on duplicate vfunc IDs', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      vfuncs: [
+        { name: 'Func1', id: 0 },
+        { name: 'Func2', id: 0 }, // duplicate
+      ],
+    };
+    const issues = validateVTableConsistency(struct, defaultContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('error');
+    expect(issues[0].rule).toBe('vtable-consistency');
+  });
+
+  it('should info on gaps in vfunc IDs', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      vfuncs: [
+        { name: 'Func1', id: 0 },
+        { name: 'Func3', id: 5 }, // gap of 4
+      ],
+    };
+    const issues = validateVTableConsistency(struct, defaultContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('info');
+    expect(issues[0].message).toContain('gap');
+  });
+});
+
+describe('validatePointerAlignment', () => {
+  const strictContext = {
+    allStructNames: new Set<string>(),
+    allEnumNames: new Set<string>(),
+    options: { strict: true },
+  };
+
+  it('should skip check in non-strict mode', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'Pointer<int>', name: 'ptr', offset: 3 }], // misaligned
+    };
+    const issues = validatePointerAlignment(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass for aligned pointers in strict mode', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [
+        { type: 'Pointer<int>', name: 'ptr1', offset: 0 },
+        { type: 'int*', name: 'ptr2', offset: 8 },
+      ],
+    };
+    const issues = validatePointerAlignment(struct, strictContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should warn for misaligned pointers in strict mode', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'Pointer<int>', name: 'ptr', offset: 5 }],
+    };
+    const issues = validatePointerAlignment(struct, strictContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('warning');
+    expect(issues[0].rule).toBe('pointer-alignment');
+  });
+});
+
+describe('validateSizeFieldMismatch', () => {
+  it('should pass when no fields exist', () => {
+    const struct: YamlStruct = { type: 'TestStruct', size: 16 };
+    const issues = validateSizeFieldMismatch(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass when struct size is larger than fields', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 32,
+      fields: [
+        { type: 'int', name: 'a', offset: 0 },
+        { type: 'int', name: 'b', offset: 4 },
+      ],
+    };
+    const issues = validateSizeFieldMismatch(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should error when declared size is less than calculated', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 8,
+      fields: [
+        { type: 'int', name: 'a', offset: 0 },
+        { type: 'long', name: 'b', offset: 8 }, // 8 + 8 = 16 > 8
+      ],
+    };
+    const issues = validateSizeFieldMismatch(struct, defaultContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('error');
+    expect(issues[0].rule).toBe('size-field-mismatch');
+  });
+
+  it('should info on large gap in strict mode', () => {
+    const strictContext = {
+      allStructNames: new Set<string>(),
+      allEnumNames: new Set<string>(),
+      options: { strict: true },
+    };
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 0x500, // 1280 bytes
+      fields: [
+        { type: 'int', name: 'a', offset: 0 },
+        { type: 'int', name: 'b', offset: 4 }, // ends at 8
+      ],
+    };
+    const issues = validateSizeFieldMismatch(struct, strictContext);
+    expect(issues.some(i => i.severity === 'info' && i.message.includes('gap'))).toBe(true);
+  });
+});
+
+describe('validateNamingConvention', () => {
+  const strictContext = {
+    allStructNames: new Set<string>(),
+    allEnumNames: new Set<string>(),
+    options: { strict: true },
+  };
+
+  it('should skip check in non-strict mode', () => {
+    const struct: YamlStruct = { type: 'bad_name', size: 16 };
+    const issues = validateNamingConvention(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass for PascalCase struct names', () => {
+    const struct: YamlStruct = { type: 'PlayerCharacter', size: 16 };
+    const issues = validateNamingConvention(struct, strictContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should info for non-PascalCase struct names', () => {
+    const struct: YamlStruct = { type: 'player_character', size: 16 };
+    const issues = validateNamingConvention(struct, strictContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('info');
+    expect(issues[0].rule).toBe('naming-convention');
+  });
+
+  it('should pass for PascalCase field names', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'int', name: 'PlayerHealth', offset: 0 }],
+    };
+    const issues = validateNamingConvention(struct, strictContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should info for non-PascalCase field names', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'int', name: 'player_health', offset: 0 }],
+    };
+    const issues = validateNamingConvention(struct, strictContext);
+    expect(issues.some(i => i.field === 'player_health')).toBe(true);
+  });
+
+  it('should pass for UPPER_SNAKE_CASE constants', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'int', name: 'MAX_HEALTH', offset: 0 }],
+    };
+    const issues = validateNamingConvention(struct, strictContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass for underscore-prefixed private fields', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'int', name: '_InternalValue', offset: 0 }],
+    };
+    const issues = validateNamingConvention(struct, strictContext);
+    expect(issues).toHaveLength(0);
   });
 });

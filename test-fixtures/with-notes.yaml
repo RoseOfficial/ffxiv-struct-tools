@@ -1,0 +1,55 @@
+structs:
+  - type: PlayerCharacter
+    size: 0x1A70
+    category: Character
+    notes: |
+      Main player character struct.
+      Handles all player state including position, stats, and animations.
+    fields:
+      - type: byte
+        name: Flags
+        offset: 0x10
+        notes: Bitfield containing player status flags
+      - type: int
+        name: Level
+        offset: 0x18
+        notes: Current job level (1-100)
+      - type: int
+        name: Experience
+        offset: 0x1C
+        notes: XP towards next level
+      - type: Utf8String
+        name: Name
+        offset: 0x50
+        notes: Character name (max 20 chars)
+      - type: Vector3
+        name: Position
+        offset: 0xB8
+        notes: World coordinates (X, Y, Z)
+
+  - type: ActionManager
+    size: 0x800
+    category: Combat
+    notes: Manages combat actions and the action queue.
+    fields:
+      - type: int
+        name: CurrentAction
+        offset: 0x10
+        notes: Currently executing action ID
+      - type: float
+        name: AnimationTime
+        offset: 0x14
+        notes: Animation progress in seconds
+      - type: Pointer<Action>
+        name: QueuedAction
+        offset: 0x18
+        notes: Next action to execute after current
+
+enums:
+  - type: JobType
+    underlying: byte
+    values:
+      None: 0
+      Gladiator: 1
+      Pugilist: 2
+      Marauder: 3

@@ -10,10 +10,13 @@ export interface YamlStruct {
   type: string;
   name?: string;
   size?: number;
+  base?: string; // Inheritance - parent struct type
   fields?: YamlField[];
   funcs?: YamlFunc[];
   vfuncs?: YamlVFunc[];
   union?: boolean;
+  notes?: string; // Documentation/notes about this struct
+  category?: string; // Category for organization (e.g., "UI", "Combat", "Character")
 }
 
 export interface YamlField {
@@ -21,6 +24,7 @@ export interface YamlField {
   name?: string;
   offset?: string | number;
   size?: number;
+  notes?: string; // Documentation/notes about this field
 }
 
 export interface YamlFunc {

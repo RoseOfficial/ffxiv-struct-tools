@@ -302,6 +302,229 @@ export function validateDuplicateOffsets(
   return issues;
 }
 
+/**
+ * Rule: Inheritance chain should reference existing structs
+ */
+export function validateInheritanceChain(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.base) return issues;
+
+  // Check if base struct exists
+  if (!context.allStructNames.has(struct.base)) {
+    issues.push({
+      severity: 'warning',
+      rule: 'inheritance-chain',
+      message: `Base struct '${struct.base}' is not defined in the current file set`,
+      struct: struct.type,
+    });
+  }
+
+  // Check for circular inheritance (self-reference)
+  if (struct.base === struct.type) {
+    issues.push({
+      severity: 'error',
+      rule: 'inheritance-chain',
+      message: `Struct inherits from itself`,
+      struct: struct.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Virtual function IDs should be sequential and reasonable
+ */
+export function validateVTableConsistency(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.vfuncs || struct.vfuncs.length === 0) return issues;
+
+  // Collect all vfunc IDs
+  const vfuncIds: { id: number; name: string }[] = [];
+  for (const vfunc of struct.vfuncs) {
+    if (vfunc.id !== undefined) {
+      vfuncIds.push({ id: vfunc.id, name: vfunc.name || '<unnamed>' });
+    }
+  }
+
+  if (vfuncIds.length === 0) return issues;
+
+  // Sort by ID
+  vfuncIds.sort((a, b) => a.id - b.id);
+
+  // Check for duplicate IDs
+  const seenIds = new Map<number, string>();
+  for (const { id, name } of vfuncIds) {
+    if (seenIds.has(id)) {
+      issues.push({
+        severity: 'error',
+        rule: 'vtable-consistency',
+        message: `VFunc '${name}' has duplicate id ${id} (same as '${seenIds.get(id)}')`,
+        struct: struct.type,
+      });
+    } else {
+      seenIds.set(id, name);
+    }
+  }
+
+  // Check for gaps in ID sequence (warning, not error - may be intentional)
+  for (let i = 1; i < vfuncIds.length; i++) {
+    const gap = vfuncIds[i].id - vfuncIds[i - 1].id;
+    if (gap > 1) {
+      issues.push({
+        severity: 'info',
+        rule: 'vtable-consistency',
+        message: `VTable has gap: id ${vfuncIds[i - 1].id} to ${vfuncIds[i].id} (missing ${gap - 1} slot${gap > 2 ? 's' : ''})`,
+        struct: struct.type,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Pointer fields should be at 8-byte aligned offsets (x64)
+ */
+export function validatePointerAlignment(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.fields) return issues;
+
+  // Only check in strict mode - many packed structs intentionally misalign
+  if (!context.options.strict) return issues;
+
+  for (const field of struct.fields) {
+    if (!isPointerType(field.type)) continue;
+
+    const offset = parseOffset(field.offset);
+    if (offset % 8 !== 0) {
+      issues.push({
+        severity: 'warning',
+        rule: 'pointer-alignment',
+        message: `Pointer field '${field.name || field.type}' at ${toHex(offset)} is not 8-byte aligned`,
+        struct: struct.type,
+        field: field.name || field.type,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Declared struct size should match calculated size from fields
+ */
+export function validateSizeFieldMismatch(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.fields || struct.fields.length === 0 || !struct.size) return issues;
+
+  // Find the highest field end position
+  let maxFieldEnd = 0;
+  for (const field of struct.fields) {
+    const offset = parseOffset(field.offset);
+    const fieldSize = estimateFieldSizeForValidation(field, context);
+
+    if (fieldSize > 0) {
+      const fieldEnd = offset + fieldSize;
+      if (fieldEnd > maxFieldEnd) {
+        maxFieldEnd = fieldEnd;
+      }
+    }
+  }
+
+  // If we couldn't calculate any field sizes, skip
+  if (maxFieldEnd === 0) return issues;
+
+  // Check if declared size is less than required size
+  if (struct.size < maxFieldEnd) {
+    issues.push({
+      severity: 'error',
+      rule: 'size-field-mismatch',
+      message: `Declared size ${toHex(struct.size)} is less than calculated minimum ${toHex(maxFieldEnd)} from fields`,
+      struct: struct.type,
+    });
+  }
+
+  // Info if there's a large gap (might indicate missing fields)
+  const gap = struct.size - maxFieldEnd;
+  if (gap > 0x100 && context.options.strict) {
+    issues.push({
+      severity: 'info',
+      rule: 'size-field-mismatch',
+      message: `Large gap of ${toHex(gap)} bytes between last field and struct size (may indicate missing fields)`,
+      struct: struct.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Naming conventions - PascalCase for structs/enums, camelCase for fields
+ */
+export function validateNamingConvention(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  // Only check in strict mode
+  if (!context.options.strict) return issues;
+
+  // Check struct name is PascalCase
+  if (struct.type && !isPascalCase(struct.type)) {
+    issues.push({
+      severity: 'info',
+      rule: 'naming-convention',
+      message: `Struct name '${struct.type}' should be PascalCase`,
+      struct: struct.type,
+    });
+  }
+
+  // Check field names are PascalCase (FFXIVClientStructs convention)
+  if (struct.fields) {
+    for (const field of struct.fields) {
+      if (field.name && !isPascalCase(field.name) && !isUpperSnakeCase(field.name)) {
+        issues.push({
+          severity: 'info',
+          rule: 'naming-convention',
+          message: `Field name '${field.name}' should be PascalCase`,
+          struct: struct.type,
+          field: field.name,
+        });
+      }
+    }
+  }
+
+  // Check vfunc names
+  if (struct.vfuncs) {
+    for (const vfunc of struct.vfuncs) {
+      if (vfunc.name && !isPascalCase(vfunc.name)) {
+        issues.push({
+          severity: 'info',
+          rule: 'naming-convention',
+          message: `VFunc name '${vfunc.name}' should be PascalCase`,
+          struct: struct.type,
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
 // ============================================================================
 // Enum Validation Rules
 // ============================================================================
@@ -373,6 +596,11 @@ const STRUCT_VALIDATORS: ValidatorFn[] = [
   validateVtableAddresses,
   validateFunctionAddresses,
   validateDuplicateOffsets,
+  validateInheritanceChain,
+  validateVTableConsistency,
+  validatePointerAlignment,
+  validateSizeFieldMismatch,
+  validateNamingConvention,
 ];
 
 /**
@@ -475,4 +703,85 @@ function estimateFieldSize(
 
   // Unknown size
   return 0;
+}
+
+/**
+ * Estimate field size for size-field-mismatch validation.
+ * Similar to estimateFieldSize but used specifically for validation.
+ */
+function estimateFieldSizeForValidation(
+  field: YamlField,
+  context: ValidationContext
+): number {
+  const type = field.type;
+  let elementSize = 0;
+
+  // Check known type sizes
+  if (TYPE_SIZES[type] !== undefined) {
+    elementSize = TYPE_SIZES[type];
+  } else if (isPointerType(type)) {
+    // Pointers are always 8 bytes on x64
+    elementSize = 8;
+  } else {
+    // Try to extract from template/array types
+    const fixedArrayMatch = type.match(/^FixedArray<(.+),\s*(\d+)>$/);
+    if (fixedArrayMatch) {
+      const innerType = fixedArrayMatch[1];
+      const count = parseInt(fixedArrayMatch[2], 10);
+      const innerSize = TYPE_SIZES[innerType] ?? 0;
+      if (innerSize > 0) return innerSize * count;
+    }
+
+    const arrayMatch = type.match(/^(.+)\[(\d+)\]$/);
+    if (arrayMatch) {
+      const innerType = arrayMatch[1];
+      const count = parseInt(arrayMatch[2], 10);
+      const innerSize = TYPE_SIZES[innerType] ?? 0;
+      if (innerSize > 0) return innerSize * count;
+    }
+  }
+
+  // If field.size is specified, treat it as array count
+  if (field.size && field.size > 1 && elementSize > 0) {
+    return field.size * elementSize;
+  }
+
+  // If we have a known element size but no array count, return element size
+  if (elementSize > 0) {
+    return elementSize;
+  }
+
+  // Unknown size
+  return 0;
+}
+
+/**
+ * Check if a string is PascalCase (starts with uppercase, no underscores except for allowed prefixes)
+ */
+function isPascalCase(name: string): boolean {
+  // Allow names that start with underscore (private/internal fields)
+  if (name.startsWith('_')) {
+    name = name.slice(1);
+  }
+
+  // Empty or single char is ok
+  if (name.length <= 1) return true;
+
+  // Should start with uppercase letter
+  if (!/^[A-Z]/.test(name)) return false;
+
+  // Should not have consecutive underscores or start/end with underscore
+  if (/__/.test(name) || name.endsWith('_')) return false;
+
+  // Common patterns that are acceptable
+  // Allow single underscores as word separators (some FFXIVClientStructs use this)
+  // Allow all caps for acronyms in the name
+  return true;
+}
+
+/**
+ * Check if a string is UPPER_SNAKE_CASE (constants)
+ */
+function isUpperSnakeCase(name: string): boolean {
+  return /^[A-Z][A-Z0-9_]*$/.test(name);
 }

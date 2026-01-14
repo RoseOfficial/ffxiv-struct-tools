@@ -23,3 +23,10 @@ coverage/
 # Environment
 .env
 .env.local
+
+# AI Tools
+.claude/
+CLAUDE.md
+.cursor/
+.aider*
+.copilot/
