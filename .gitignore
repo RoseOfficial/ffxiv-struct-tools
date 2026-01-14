@@ -30,3 +30,7 @@ CLAUDE.md
 .cursor/
 .aider*
 .copilot/
+
+# Signature files (binary-specific, regenerate per machine)
+*.sigs.json
+*.sigs.yaml

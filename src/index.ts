@@ -27,6 +27,7 @@ import {
   runVTablesDiff,
   type VTablesOptions,
 } from './commands/vtables.js';
+import { createSigCommand } from './commands/sig.js';
 
 program
   .name('fst')
@@ -190,5 +191,8 @@ program.addCommand(createCompareReportCommand());
 
 // report command
 program.addCommand(createReportCommand());
+
+// sig command
+program.addCommand(createSigCommand());
 
 program.parse();

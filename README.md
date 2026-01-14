@@ -295,9 +295,133 @@ The `dalamud-plugin/` directory contains a Dalamud plugin for in-game struct val
 
 See [dalamud-plugin/README.md](./dalamud-plugin/README.md) for installation and usage instructions.
 
-### Coming Soon
+### `fst sig`
 
-- `fst vtables` - Track vtable addresses across game versions
+Signature-based automatic offset discovery. Extract byte patterns from the current game binary, then scan new binaries after patches to detect where offsets shifted.
+
+```bash
+# Extract signatures from binary based on YAML definitions
+fst sig extract ./ffxiv_dx11.exe "./ida/*.yml" -v "7.1"
+
+# Scan a new binary for signature matches and detect changes
+fst sig scan ./new_ffxiv_dx11.exe --sigs "*.sigs.yaml"
+
+# Check signature coverage and health
+fst sig status
+```
+
+#### `fst sig extract`
+
+Extract byte patterns from the game binary that reference known struct fields.
+
+```bash
+# Extract with version identifier
+fst sig extract ./ffxiv_dx11.exe "./ida/*.yml" --version "7.1"
+
+# Output to single JSON file
+fst sig extract ./ffxiv_dx11.exe "./structs.yml" --output signatures.json
+
+# Set minimum confidence threshold
+fst sig extract ./ffxiv_dx11.exe "./structs.yml" --min-confidence 80
+```
+
+**Options:**
+- `-v, --version <version>` - Version identifier (auto-detected if not specified)
+- `-o, --output <path>` - Output file path (default: individual .sigs.yaml files)
+- `--min-confidence <n>` - Minimum confidence threshold (default: 70)
+- `--json` - Output as JSON
+
+#### `fst sig scan`
+
+Scan a new binary for previously extracted signatures and detect offset changes.
+
+```bash
+# Scan with default signature files (*.sigs.yaml)
+fst sig scan ./new_ffxiv_dx11.exe
+
+# Specify signature files
+fst sig scan ./new_ffxiv_dx11.exe --sigs "./sigs/*.json"
+
+# Output results to file
+fst sig scan ./new_ffxiv_dx11.exe --output scan-results.json
+
+# Filter by confidence
+fst sig scan ./new_ffxiv_dx11.exe --min-confidence 80
+```
+
+**Options:**
+- `-s, --sigs <patterns...>` - Signature file paths or glob patterns
+- `-o, --output <path>` - Output file path for results
+- `--min-confidence <n>` - Minimum confidence to report (default: 0)
+- `--json` - Output as JSON
+
+**Output includes:**
+- Matched/missing signature counts
+- Detected field offset changes with confidence scores
+- Detected bulk shift patterns (e.g., "all Character fields shifted +0x8")
+- Pattern grouping with likely cause analysis
+
+#### `fst sig status`
+
+Report signature health and coverage statistics.
+
+```bash
+# Check all signature files in current directory
+fst sig status
+
+# Check specific files
+fst sig status "./sigs/*.json"
+
+# Output as JSON
+fst sig status --json
+```
+
+**Signature Workflow:**
+
+```
+1. Before patch:  fst sig extract ./ffxiv.exe ./structs.yml -v "7.1"
+                  → Creates signature files with byte patterns
+
+2. After patch:   fst sig scan ./new_ffxiv.exe
+                  → Detects changes: "PlayerCharacter.ActionManager: 0x1A0 → 0x1A8 [94%]"
+                  → Detects patterns: "bulk_shift_+0x8 affects 15 structs"
+
+3. Apply changes: fst patch ./structs.yml --from-scan scan-results.json
+                  → (Integration coming in future update)
+```
+
+### `fst vtables`
+
+Track vtable addresses and slot changes across game versions.
+
+```bash
+# Extract vtable information
+fst vtables extract "./ida/*.yml" --version "7.1" --output vtables.json
+
+# Compare vtables between versions
+fst vtables diff ./old-vtables.json ./new-vtables.json
+```
+
+### `fst version`
+
+Track struct evolution across game versions.
+
+```bash
+# Save a version snapshot
+fst version save "7.1" --path "./ida/*.yml" --notes "Post-patch update"
+
+# List all saved versions
+fst version list
+
+# Compare two versions
+fst version diff "7.0" "7.1"
+
+# Show history for a specific struct
+fst version history PlayerCharacter
+
+# Delete a version
+fst version delete "7.0" --force
+```
 
 ## Development
 
