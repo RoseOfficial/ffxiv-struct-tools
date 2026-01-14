@@ -7,12 +7,15 @@ import chalk from 'chalk';
 import { parseYamlFile, type ParsedFile } from '../lib/yaml-parser.js';
 import {
   diff,
+  diffStructs,
+  detectHierarchyDeltas,
   type DiffResult,
   type StructDiff,
   type EnumDiff,
   type FieldChange,
   type FuncChange,
   type VFuncChange,
+  type HierarchyDeltaCandidate,
 } from '../lib/diff-engine.js';
 import { toHex } from '../lib/types.js';
 
@@ -81,24 +84,42 @@ export async function runDiff(
   // Run diff
   const result = diff(oldStructs, newStructs, oldEnums, newEnums);
 
+  // Detect hierarchy deltas for enhanced pattern display
+  let hierarchyDeltas: HierarchyDeltaCandidate[] = [];
+  if (options.detectPatterns) {
+    const structDiffs = diffStructs(oldStructs, newStructs);
+    hierarchyDeltas = detectHierarchyDeltas(oldStructs, newStructs, structDiffs);
+  }
+
   // Output results
   if (options.json) {
-    console.log(JSON.stringify(result, null, 2));
+    const jsonResult = {
+      ...result,
+      hierarchyDeltas: options.detectPatterns ? hierarchyDeltas : undefined,
+    };
+    console.log(JSON.stringify(jsonResult, null, 2));
     return;
   }
 
   // Print human-readable diff
-  printDiffResult(result, options);
+  printDiffResult(result, options, hierarchyDeltas);
 }
 
 /**
  * Print diff result in human-readable format
  */
-function printDiffResult(result: DiffResult, options: DiffOptions): void {
+function printDiffResult(
+  result: DiffResult,
+  options: DiffOptions,
+  hierarchyDeltas: HierarchyDeltaCandidate[] = []
+): void {
   const { structs, enums, patterns, stats } = result;
 
-  // Print pattern analysis first if detected
-  if (options.detectPatterns && patterns.summary !== 'No consistent patterns detected') {
+  // Print hierarchy-aware pattern analysis first if detected
+  if (options.detectPatterns && hierarchyDeltas.length > 0) {
+    printHierarchyPatterns(hierarchyDeltas);
+  } else if (options.detectPatterns && patterns.summary !== 'No consistent patterns detected') {
+    // Fallback to original pattern display
     console.log(chalk.magenta.bold('Pattern Analysis'));
     console.log(chalk.magenta('─────────────────'));
     console.log(patterns.summary);
@@ -351,4 +372,58 @@ function getChangeColor(type: string): (text: string) => string {
     case 'modified': return chalk.yellow;
     default: return chalk.white;
   }
+}
+
+/**
+ * Print hierarchy-aware pattern analysis
+ */
+function printHierarchyPatterns(deltas: HierarchyDeltaCandidate[]): void {
+  console.log(chalk.magenta.bold('═══════════════════════════════════════════════════════════════'));
+  console.log(chalk.magenta.bold('  DETECTED PATTERNS (by inheritance hierarchy)'));
+  console.log(chalk.magenta.bold('═══════════════════════════════════════════════════════════════'));
+  console.log();
+
+  for (const delta of deltas) {
+    const sign = delta.delta >= 0 ? '+' : '';
+    const confidenceBar = '█'.repeat(Math.floor(delta.confidence * 10)) +
+                          '░'.repeat(10 - Math.floor(delta.confidence * 10));
+    const confidenceColor = delta.confidence >= 0.7 ? chalk.green :
+                            delta.confidence >= 0.5 ? chalk.yellow : chalk.red;
+
+    console.log(chalk.cyan.bold(`  ${delta.hierarchy} hierarchy`));
+    console.log(chalk.white(`  ├─ Delta: ${chalk.yellow.bold(`${sign}${toHex(delta.delta)}`)} from offset ${toHex(delta.startOffset)}`));
+    console.log(chalk.white(`  ├─ Confidence: [${confidenceColor(confidenceBar)}] ${(delta.confidence * 100).toFixed(0)}%`));
+    console.log(chalk.white(`  ├─ Fields: ${delta.matchCount}/${delta.totalFields} match this pattern`));
+    console.log(chalk.white(`  ├─ Structs: ${delta.structNames.length} (${delta.structNames.slice(0, 5).join(', ')}${delta.structNames.length > 5 ? '...' : ''})`));
+
+    if (delta.anomalies.length > 0) {
+      console.log(chalk.white(`  ├─ `) + chalk.yellow(`⚠ ${delta.anomalies.length} anomalies (different delta)`));
+    }
+
+    // Print suggested command
+    const structPattern = delta.structNames.length === 1
+      ? delta.hierarchy
+      : `${delta.hierarchy}*`;
+    const command = `ffxiv-struct-tools patch --delta ${sign}${toHex(delta.delta)} --start-offset ${toHex(delta.startOffset)} --struct "${structPattern}"`;
+
+    console.log(chalk.white(`  └─ `) + chalk.gray(`Command: ${chalk.white(command)}`));
+    console.log();
+  }
+
+  // Print summary
+  const highConfidence = deltas.filter(d => d.confidence >= 0.7).length;
+  const totalFields = deltas.reduce((sum, d) => sum + d.matchCount, 0);
+  const totalStructs = new Set(deltas.flatMap(d => d.structNames)).size;
+
+  console.log(chalk.magenta('───────────────────────────────────────────────────────────────'));
+  console.log(chalk.white(`  Summary: ${deltas.length} hierarchies with detected deltas`));
+  console.log(chalk.white(`           ${highConfidence} high confidence (≥70%), ${totalFields} fields, ${totalStructs} structs`));
+
+  if (highConfidence > 0) {
+    console.log();
+    console.log(chalk.green.bold(`  ✓ Use 'patch --auto-detect' for automated patching workflow`));
+  }
+
+  console.log(chalk.magenta('═══════════════════════════════════════════════════════════════'));
+  console.log();
 }

@@ -480,6 +480,228 @@ function diffEnumValues(
 }
 
 // ============================================================================
+// Inheritance Hierarchy
+// ============================================================================
+
+export interface InheritanceHierarchy {
+  /** Root struct name (the ultimate base class) */
+  root: string;
+  /** All struct names in this hierarchy (including root) */
+  members: Set<string>;
+  /** Map from struct name to its direct parent */
+  parentMap: Map<string, string>;
+}
+
+/**
+ * Build inheritance hierarchies from struct definitions
+ * Groups structs by their inheritance chains (e.g., all Character-derived structs together)
+ */
+export function buildInheritanceHierarchies(
+  structs: YamlStruct[]
+): InheritanceHierarchy[] {
+  // Build parent map
+  const parentMap = new Map<string, string>();
+  const allStructNames = new Set<string>();
+
+  for (const struct of structs) {
+    if (struct.type) {
+      allStructNames.add(struct.type);
+      if (struct.base) {
+        parentMap.set(struct.type, struct.base);
+      }
+    }
+  }
+
+  // Find root for each struct (follow parent chain until we hit a struct with no parent)
+  const rootMap = new Map<string, string>();
+
+  function findRoot(name: string, visited = new Set<string>()): string {
+    if (visited.has(name)) return name; // Circular inheritance, treat as root
+    visited.add(name);
+
+    const parent = parentMap.get(name);
+    if (!parent || !allStructNames.has(parent)) {
+      return name; // No parent or parent not in our set = this is a root
+    }
+    return findRoot(parent, visited);
+  }
+
+  for (const name of allStructNames) {
+    rootMap.set(name, findRoot(name));
+  }
+
+  // Group structs by their root
+  const hierarchyMap = new Map<string, Set<string>>();
+  for (const [name, root] of rootMap) {
+    if (!hierarchyMap.has(root)) {
+      hierarchyMap.set(root, new Set());
+    }
+    hierarchyMap.get(root)!.add(name);
+  }
+
+  // Build hierarchy objects
+  const hierarchies: InheritanceHierarchy[] = [];
+  for (const [root, members] of hierarchyMap) {
+    // Filter parentMap to only include members of this hierarchy
+    const filteredParentMap = new Map<string, string>();
+    for (const member of members) {
+      const parent = parentMap.get(member);
+      if (parent) {
+        filteredParentMap.set(member, parent);
+      }
+    }
+
+    hierarchies.push({
+      root,
+      members,
+      parentMap: filteredParentMap,
+    });
+  }
+
+  // Sort by size (larger hierarchies first)
+  hierarchies.sort((a, b) => b.members.size - a.members.size);
+
+  return hierarchies;
+}
+
+// ============================================================================
+// Hierarchy-Aware Delta Detection
+// ============================================================================
+
+export interface HierarchyDeltaCandidate {
+  /** The inheritance hierarchy this delta applies to */
+  hierarchy: string;
+  /** All struct names in the hierarchy */
+  structNames: string[];
+  /** The detected offset delta */
+  delta: number;
+  /** Starting offset where shift begins */
+  startOffset: number;
+  /** Number of fields that match this delta */
+  matchCount: number;
+  /** Total fields that were analyzed */
+  totalFields: number;
+  /** Confidence score (0-1) */
+  confidence: number;
+  /** Fields that match this delta pattern */
+  matchingFields: { struct: string; field: string; oldOffset: number; newOffset: number }[];
+  /** Fields that don't match (potential anomalies) */
+  anomalies: { struct: string; field: string; oldOffset: number; newOffset: number; actualDelta: number }[];
+}
+
+/**
+ * Detect delta candidates for each inheritance hierarchy
+ * This is the core algorithm for auto-detecting offset shifts
+ */
+export function detectHierarchyDeltas(
+  oldStructs: YamlStruct[],
+  newStructs: YamlStruct[],
+  structDiffs: StructDiff[]
+): HierarchyDeltaCandidate[] {
+  // Build hierarchies from old structs (they define the structure we're patching)
+  const hierarchies = buildInheritanceHierarchies(oldStructs);
+
+  // Create lookup map for new structs
+  const newStructMap = new Map(newStructs.map(s => [s.type, s]));
+  const oldStructMap = new Map(oldStructs.map(s => [s.type, s]));
+
+  const candidates: HierarchyDeltaCandidate[] = [];
+
+  for (const hierarchy of hierarchies) {
+    // Collect all field offset changes within this hierarchy
+    const offsetChanges: {
+      struct: string;
+      field: string;
+      oldOffset: number;
+      newOffset: number;
+      delta: number;
+    }[] = [];
+
+    for (const structName of hierarchy.members) {
+      const diff = structDiffs.find(d => d.structName === structName);
+      if (!diff || diff.type !== 'modified') continue;
+
+      for (const fieldChange of diff.fieldChanges) {
+        if (fieldChange.type === 'modified' &&
+            fieldChange.oldOffset !== undefined &&
+            fieldChange.newOffset !== undefined) {
+          const delta = fieldChange.newOffset - fieldChange.oldOffset;
+          if (delta !== 0) {
+            offsetChanges.push({
+              struct: structName,
+              field: fieldChange.fieldName,
+              oldOffset: fieldChange.oldOffset,
+              newOffset: fieldChange.newOffset,
+              delta,
+            });
+          }
+        }
+      }
+    }
+
+    if (offsetChanges.length === 0) continue;
+
+    // Find the most common delta
+    const deltaCounts = new Map<number, typeof offsetChanges>();
+    for (const change of offsetChanges) {
+      if (!deltaCounts.has(change.delta)) {
+        deltaCounts.set(change.delta, []);
+      }
+      deltaCounts.get(change.delta)!.push(change);
+    }
+
+    // Sort deltas by frequency
+    const sortedDeltas = [...deltaCounts.entries()]
+      .sort((a, b) => b[1].length - a[1].length);
+
+    if (sortedDeltas.length === 0) continue;
+
+    // Take the most common delta as the candidate
+    const [bestDelta, matchingChanges] = sortedDeltas[0];
+    const otherChanges = offsetChanges.filter(c => c.delta !== bestDelta);
+
+    // Find the minimum start offset
+    const startOffset = Math.min(...matchingChanges.map(c => c.oldOffset));
+
+    // Calculate confidence
+    const totalChanges = offsetChanges.length;
+    const matchRatio = matchingChanges.length / totalChanges;
+    const hierarchySize = hierarchy.members.size;
+    const sizeBonus = Math.min(0.2, hierarchySize / 50); // Larger hierarchies get slight bonus
+
+    const confidence = Math.min(1, matchRatio * 0.8 + sizeBonus + (matchingChanges.length >= 5 ? 0.1 : 0));
+
+    candidates.push({
+      hierarchy: hierarchy.root,
+      structNames: [...hierarchy.members],
+      delta: bestDelta,
+      startOffset,
+      matchCount: matchingChanges.length,
+      totalFields: totalChanges,
+      confidence,
+      matchingFields: matchingChanges.map(c => ({
+        struct: c.struct,
+        field: c.field,
+        oldOffset: c.oldOffset,
+        newOffset: c.newOffset,
+      })),
+      anomalies: otherChanges.map(c => ({
+        struct: c.struct,
+        field: c.field,
+        oldOffset: c.oldOffset,
+        newOffset: c.newOffset,
+        actualDelta: c.delta,
+      })),
+    });
+  }
+
+  // Sort by confidence descending
+  candidates.sort((a, b) => b.confidence - a.confidence);
+
+  return candidates;
+}
+
+// ============================================================================
 // Pattern Detection
 // ============================================================================
 
