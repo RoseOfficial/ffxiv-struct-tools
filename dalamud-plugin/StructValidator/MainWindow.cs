@@ -5,7 +5,7 @@ using System.Linq;
 using System.Numerics;
 using System.Text.Json;
 using Dalamud.Interface.Windowing;
-using ImGuiNET;
+using Dalamud.Bindings.ImGui;
 
 namespace StructValidator;
 
@@ -127,22 +127,38 @@ public class MainWindow : Window, IDisposable
             ImGui.Text("Display Settings");
             ImGui.Separator();
 
-            if (ImGui.Checkbox("Show Info Issues", ref configuration.ShowInfoIssues))
+            var showInfo = configuration.ShowInfoIssues;
+            if (ImGui.Checkbox("Show Info Issues", ref showInfo))
+            {
+                configuration.ShowInfoIssues = showInfo;
                 configuration.Save();
+            }
 
-            if (ImGui.Checkbox("Show Warnings", ref configuration.ShowWarnings))
+            var showWarnings = configuration.ShowWarnings;
+            if (ImGui.Checkbox("Show Warnings", ref showWarnings))
+            {
+                configuration.ShowWarnings = showWarnings;
                 configuration.Save();
+            }
 
             ImGui.Separator();
 
             ImGui.Text("Validation Settings");
 
-            if (ImGui.Checkbox("Only Structs with Declared Sizes", ref configuration.OnlyDeclaredSizes))
+            var onlyDeclared = configuration.OnlyDeclaredSizes;
+            if (ImGui.Checkbox("Only Structs with Declared Sizes", ref onlyDeclared))
+            {
+                configuration.OnlyDeclaredSizes = onlyDeclared;
                 configuration.Save();
+            }
 
             ImGui.SetNextItemWidth(200);
-            if (ImGui.InputText("Namespace Filter", ref configuration.NamespaceFilter, 256))
+            var nsFilter = configuration.NamespaceFilter;
+            if (ImGui.InputText("Namespace Filter", ref nsFilter, 256))
+            {
+                configuration.NamespaceFilter = nsFilter;
                 configuration.Save();
+            }
 
             ImGui.EndPopup();
         }
@@ -170,7 +186,7 @@ public class MainWindow : Window, IDisposable
         var detailWidth = availableWidth * 0.6f - 10;
 
         // Left panel - struct list
-        if (ImGui.BeginChild("StructList", new Vector2(listWidth, -1), ImGuiChildFlags.Border))
+        if (ImGui.BeginChild("StructList", new Vector2(listWidth, -1), true))
         {
             DrawStructList();
         }
@@ -179,7 +195,7 @@ public class MainWindow : Window, IDisposable
         ImGui.SameLine();
 
         // Right panel - details
-        if (ImGui.BeginChild("StructDetails", new Vector2(detailWidth, -1), ImGuiChildFlags.Border))
+        if (ImGui.BeginChild("StructDetails", new Vector2(detailWidth, -1), true))
         {
             DrawStructDetails();
         }

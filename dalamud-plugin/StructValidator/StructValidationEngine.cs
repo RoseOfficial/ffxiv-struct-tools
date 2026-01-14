@@ -4,7 +4,6 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using Dalamud.Plugin.Services;
-using FFXIVClientStructs.Attributes;
 
 namespace StructValidator;
 
@@ -14,12 +13,34 @@ namespace StructValidator;
 public class StructValidationEngine
 {
     private readonly IPluginLog pluginLog;
-    private readonly Assembly clientStructsAssembly;
+    private Assembly? clientStructsAssembly;
+    private string? initError;
 
     public StructValidationEngine(IPluginLog pluginLog)
     {
         this.pluginLog = pluginLog;
-        this.clientStructsAssembly = typeof(FFXIVClientStructs.FFXIV.Client.Game.Character.Character).Assembly;
+
+        try
+        {
+            // Find FFXIVClientStructs assembly dynamically
+            clientStructsAssembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "FFXIVClientStructs");
+
+            if (clientStructsAssembly == null)
+            {
+                initError = "FFXIVClientStructs assembly not found in loaded assemblies";
+                pluginLog.Error(initError);
+            }
+            else
+            {
+                pluginLog.Info($"Found FFXIVClientStructs assembly: {clientStructsAssembly.FullName}");
+            }
+        }
+        catch (Exception ex)
+        {
+            initError = $"Failed to initialize: {ex.Message}";
+            pluginLog.Error(ex, "Failed to initialize StructValidationEngine");
+        }
     }
 
     /// <summary>
@@ -34,34 +55,85 @@ public class StructValidationEngine
             Results = new List<StructValidationResult>()
         };
 
-        var structTypes = GetStructTypes();
-
-        foreach (var type in structTypes)
+        if (clientStructsAssembly == null)
         {
-            try
+            report.Summary = new ValidationSummary
             {
-                var result = ValidateStruct(type);
-                report.Results.Add(result);
-            }
-            catch (Exception ex)
+                TotalStructs = 0,
+                PassedStructs = 0,
+                FailedStructs = 1,
+                TotalIssues = 1,
+                ErrorCount = 1
+            };
+            report.Results.Add(new StructValidationResult
             {
-                pluginLog.Warning(ex, $"Failed to validate {type.FullName}");
-                report.Results.Add(new StructValidationResult
+                StructName = "Initialization",
+                Namespace = "",
+                Passed = false,
+                Issues = new List<ValidationIssue>
                 {
-                    StructName = type.FullName ?? type.Name,
-                    Namespace = type.Namespace ?? "",
-                    Passed = false,
-                    Issues = new List<ValidationIssue>
+                    new()
                     {
-                        new()
-                        {
-                            Severity = "error",
-                            Rule = "validation-error",
-                            Message = $"Validation failed: {ex.Message}"
-                        }
+                        Severity = "error",
+                        Rule = "init-error",
+                        Message = initError ?? "FFXIVClientStructs assembly not loaded"
                     }
-                });
+                }
+            });
+            return report;
+        }
+
+        try
+        {
+            var structTypes = GetStructTypes().ToList();
+            pluginLog.Info($"Found {structTypes.Count} struct types to validate");
+
+            foreach (var type in structTypes)
+            {
+                try
+                {
+                    var result = ValidateStruct(type);
+                    report.Results.Add(result);
+                }
+                catch (Exception ex)
+                {
+                    pluginLog.Warning(ex, $"Failed to validate {type.FullName}");
+                    report.Results.Add(new StructValidationResult
+                    {
+                        StructName = type.FullName ?? type.Name,
+                        Namespace = type.Namespace ?? "",
+                        Passed = false,
+                        Issues = new List<ValidationIssue>
+                        {
+                            new()
+                            {
+                                Severity = "error",
+                                Rule = "validation-error",
+                                Message = $"Validation failed: {ex.Message}"
+                            }
+                        }
+                    });
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            pluginLog.Error(ex, "Failed to enumerate struct types");
+            report.Results.Add(new StructValidationResult
+            {
+                StructName = "TypeEnumeration",
+                Namespace = "",
+                Passed = false,
+                Issues = new List<ValidationIssue>
+                {
+                    new()
+                    {
+                        Severity = "error",
+                        Rule = "enumeration-error",
+                        Message = $"Failed to enumerate types: {ex.Message}"
+                    }
+                }
+            });
         }
 
         // Calculate summary
@@ -84,6 +156,9 @@ public class StructValidationEngine
     /// </summary>
     public StructValidationResult? ValidateByName(string structName)
     {
+        if (clientStructsAssembly == null)
+            return null;
+
         var type = GetStructTypes().FirstOrDefault(t =>
             t.Name == structName ||
             t.FullName == structName ||
@@ -293,23 +368,51 @@ public class StructValidationEngine
 
     private IEnumerable<Type> GetStructTypes()
     {
-        return clientStructsAssembly.GetTypes()
-            .Where(t => t.IsValueType &&
-                       !t.IsEnum &&
-                       !t.IsPrimitive &&
-                       t.Namespace?.StartsWith("FFXIVClientStructs") == true &&
-                       t.GetCustomAttribute<StructLayoutAttribute>() != null);
+        if (clientStructsAssembly == null)
+            return Enumerable.Empty<Type>();
+
+        try
+        {
+            var allTypes = clientStructsAssembly.GetTypes();
+            pluginLog.Debug($"Total types in assembly: {allTypes.Length}");
+
+            var ffxivTypes = allTypes.Where(t => t.Namespace?.StartsWith("FFXIVClientStructs") == true).ToList();
+            pluginLog.Debug($"Types in FFXIVClientStructs namespace: {ffxivTypes.Count}");
+
+            var valueTypes = ffxivTypes.Where(t => t.IsValueType && !t.IsEnum && !t.IsPrimitive).ToList();
+            pluginLog.Debug($"Value types (structs): {valueTypes.Count}");
+
+            // Log a sample of what we found
+            foreach (var t in valueTypes.Take(5))
+            {
+                pluginLog.Debug($"Sample struct: {t.FullName}");
+            }
+
+            return valueTypes;
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            // Some types may fail to load, return what we can
+            pluginLog.Warning(ex, "Some types failed to load");
+            var loadedTypes = ex.Types.Where(t => t != null).ToList();
+            pluginLog.Debug($"Loaded {loadedTypes.Count} types despite errors");
+
+            return loadedTypes.Where(t => t!.IsValueType &&
+                                          !t.IsEnum &&
+                                          !t.IsPrimitive &&
+                                          t.Namespace?.StartsWith("FFXIVClientStructs") == true)!;
+        }
     }
 
     private string GetGameVersion()
     {
         try
         {
-            // Try to get game version from FFXIVClientStructs
-            var versionType = clientStructsAssembly.GetType("FFXIVClientStructs.FFXIV.Client.System.Framework.Framework");
-            if (versionType != null)
+            if (clientStructsAssembly != null)
             {
-                return "Unknown"; // Would need actual game memory access
+                var version = clientStructsAssembly.GetName().Version;
+                if (version != null)
+                    return version.ToString();
             }
         }
         catch { }
