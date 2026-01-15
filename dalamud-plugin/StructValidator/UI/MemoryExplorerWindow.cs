@@ -29,6 +29,7 @@ public class MemoryExplorerWindow : Window, IDisposable
     private readonly SessionStore? sessionStore;
     private readonly SessionPanel? sessionPanel;
     private readonly VTableAnalyzerService vtableAnalyzer;
+    private readonly ChangeMonitor changeMonitor;
     private readonly IPluginLog log;
 
     // Singleton selection
@@ -60,9 +61,8 @@ public class MemoryExplorerWindow : Window, IDisposable
 
     // Field list state
     private DiscoveredField? selectedField;
-    private bool showOnlyUndocumented = false;
+    private bool showOnlyUnmatched = false;
     private bool showPadding = false;
-    private float minConfidence = 0.0f;
 
     public MemoryExplorerWindow(
         StructValidationEngine validationEngine,
@@ -76,6 +76,7 @@ public class MemoryExplorerWindow : Window, IDisposable
         this.sessionStore = sessionStore;
         this.log = log;
         this.vtableAnalyzer = new VTableAnalyzerService(log);
+        this.changeMonitor = new ChangeMonitor();
 
         if (sessionStore != null)
         {
@@ -89,7 +90,10 @@ public class MemoryExplorerWindow : Window, IDisposable
         };
     }
 
-    public void Dispose() { }
+    public void Dispose()
+    {
+        changeMonitor?.Dispose();
+    }
 
     /// <summary>
     /// Refresh the list of available singletons.
@@ -124,6 +128,9 @@ public class MemoryExplorerWindow : Window, IDisposable
 
     public override void Draw()
     {
+        // Update change monitor
+        changeMonitor.Update();
+
         DrawToolbar();
         ImGui.Separator();
 
@@ -153,14 +160,15 @@ public class MemoryExplorerWindow : Window, IDisposable
 
     private void DrawWelcomeMessage()
     {
-        ImGui.TextWrapped("Memory Explorer - Explore struct layouts in game memory");
+        ImGui.TextWrapped("Memory Explorer - View struct layouts in game memory");
         ImGui.Spacing();
         ImGui.TextWrapped("Options:");
         ImGui.BulletText("Select a singleton from the dropdown and click 'Analyze'");
         ImGui.BulletText("Enter a memory address directly and click 'Go'");
         ImGui.BulletText("Click 'Explore' on pointer fields to navigate to their targets");
+        ImGui.BulletText("Use the 'Watch' tab to monitor fields for changes during gameplay");
         ImGui.Spacing();
-        ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "The explorer will scan memory and infer field types, then compare with FFXIVClientStructs definitions.");
+        ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "View memory with multiple interpretations (int/float/pointer). Use FFXIVClientStructs definitions for declared types.");
     }
 
     private void DrawToolbar()
@@ -229,6 +237,13 @@ public class MemoryExplorerWindow : Window, IDisposable
             if (ImGui.Button("Export YAML"))
             {
                 ExportToYaml();
+            }
+
+            ImGui.SameLine();
+
+            if (ImGui.Button("Export ReClass"))
+            {
+                ExportToReClass();
             }
         }
 
@@ -650,6 +665,13 @@ public class MemoryExplorerWindow : Window, IDisposable
                 ImGui.EndTabItem();
             }
 
+            // Watch tab for change monitoring
+            if (ImGui.BeginTabItem("Watch"))
+            {
+                DrawWatchTab();
+                ImGui.EndTabItem();
+            }
+
             // Sessions tab (only if session storage is available)
             if (sessionPanel != null && ImGui.BeginTabItem("Sessions"))
             {
@@ -661,15 +683,24 @@ public class MemoryExplorerWindow : Window, IDisposable
         }
     }
 
+    private void DrawWatchTab()
+    {
+        ChangeMonitorPanel.Draw(
+            changeMonitor,
+            address =>
+            {
+                // Navigate to watched address
+                addressInput = $"0x{address:X}";
+                NavigateToAddress();
+            });
+    }
+
     private void DrawFieldsTab()
     {
         // Filters
-        ImGui.Checkbox("Show Only Undocumented", ref showOnlyUndocumented);
+        ImGui.Checkbox("Show Only Unmatched", ref showOnlyUnmatched);
         ImGui.SameLine();
         ImGui.Checkbox("Show Padding", ref showPadding);
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(100);
-        ImGui.SliderFloat("Min Confidence", ref minConfidence, 0.0f, 1.0f, "%.1f");
 
         ImGui.Separator();
 
@@ -999,86 +1030,167 @@ public class MemoryExplorerWindow : Window, IDisposable
 
     private void DrawFieldList()
     {
-        if (currentLayout == null) return;
+        if (currentLayout == null || currentNavigation == null) return;
 
-        // Add a column for explore button
-        if (ImGui.BeginTable("DiscoveredFieldsTable", 6, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY))
+        // Multi-interpretation table
+        if (ImGui.BeginTable("FieldsTable", 8, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY))
         {
             ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.None, 55);
-            ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.None, 70);
-            ImGui.TableSetupColumn("Conf", ImGuiTableColumnFlags.None, 35);
-            ImGui.TableSetupColumn("Declared", ImGuiTableColumnFlags.None, 90);
-            ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.None, 90);
-            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.None, 50); // Explore button
+            ImGui.TableSetupColumn("Hex", ImGuiTableColumnFlags.None, 80);
+            ImGui.TableSetupColumn("Int", ImGuiTableColumnFlags.None, 70);
+            ImGui.TableSetupColumn("Float", ImGuiTableColumnFlags.None, 70);
+            ImGui.TableSetupColumn("Ptr", ImGuiTableColumnFlags.None, 70);
+            ImGui.TableSetupColumn("Declared", ImGuiTableColumnFlags.None, 100);
+            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 25); // Navigate
+            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 25); // Watch
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableHeadersRow();
 
             var fields = currentLayout.Fields
-                .Where(f => !showOnlyUndocumented || !f.HasMatch)
-                .Where(f => showPadding || f.InferredType != InferredTypeKind.Padding)
-                .Where(f => f.Confidence >= minConfidence);
+                .Where(f => !showOnlyUnmatched || !f.HasMatch)
+                .Where(f => showPadding || f.InferredType != InferredTypeKind.Padding);
 
             foreach (var field in fields)
             {
                 ImGui.TableNextRow();
 
-                // Determine row color
+                // Row color based on match status only
                 Vector4 rowColor;
                 if (field.HasMatch)
                     rowColor = new Vector4(0.5f, 1.0f, 0.5f, 1.0f);
                 else if (field.InferredType == InferredTypeKind.Padding)
                     rowColor = new Vector4(0.5f, 0.5f, 0.5f, 1.0f);
-                else if (field.Confidence > 0.7f)
-                    rowColor = new Vector4(1.0f, 1.0f, 0.5f, 1.0f);
                 else
                     rowColor = new Vector4(1.0f, 1.0f, 1.0f, 1.0f);
 
                 ImGui.PushStyleColor(ImGuiCol.Text, rowColor);
 
+                // Get multi-interpretation for this field
+                var address = currentNavigation.Address + field.Offset;
+                var interp = TypeInference.GetInterpretations(address, Math.Min(field.Size, 8));
+
+                // Offset (selectable)
                 ImGui.TableNextColumn();
                 bool isSelected = selectedField == field;
                 if (ImGui.Selectable($"0x{field.Offset:X}##field{field.Offset}", isSelected, ImGuiSelectableFlags.SpanAllColumns))
                 {
                     selectedField = field;
                 }
-                ImGui.TableNextColumn();
-                ImGui.Text(field.TypeString);
-                ImGui.TableNextColumn();
-                ImGui.Text($"{field.Confidence:P0}");
-                ImGui.TableNextColumn();
-                ImGui.Text(field.DeclaredName ?? "");
-                ImGui.TableNextColumn();
-                ImGui.Text(TruncateValue(field.Value, 12));
-                ImGui.TableNextColumn();
 
-                // Explore button for pointers
-                if (field.InferredType is InferredTypeKind.Pointer or InferredTypeKind.VTablePointer or InferredTypeKind.StringPointer)
+                // Hex bytes
+                ImGui.TableNextColumn();
+                var hexDisplay = interp.HexString.Length > 12 ? interp.HexString[..12] + ".." : interp.HexString;
+                ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), hexDisplay);
+
+                // Int interpretation
+                ImGui.TableNextColumn();
+                if (field.Size >= 4 && interp.AsInt32 != null)
                 {
-                    if (field.PointerTarget.HasValue && field.PointerTarget.Value != 0)
-                    {
-                        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.4f, 0.6f, 1.0f));
-                        if (ImGui.SmallButton($"->##ptr{field.Offset}"))
-                        {
-                            var targetType = TryResolvePointerType(field);
-                            var targetSize = GetPointerTargetSize(targetType);
-                            NavigateTo(
-                                field.PointerTarget.Value,
-                                targetSize,
-                                targetType,
-                                field.DeclaredName ?? $"0x{field.Offset:X}",
-                                field.Offset);
-                        }
-                        ImGui.PopStyleColor();
+                    ImGui.Text(interp.AsInt32);
+                }
+                else if (field.Size >= 2 && interp.AsInt16 != null)
+                {
+                    ImGui.Text(interp.AsInt16);
+                }
+                else if (interp.AsInt8 != null)
+                {
+                    ImGui.Text(interp.AsInt8);
+                }
+                else
+                {
+                    ImGui.TextColored(new Vector4(0.4f, 0.4f, 0.4f, 1.0f), "-");
+                }
 
-                        if (ImGui.IsItemHovered())
-                        {
-                            ImGui.BeginTooltip();
-                            ImGui.Text($"Explore 0x{field.PointerTarget.Value:X}");
-                            var targetType = TryResolvePointerType(field);
-                            if (!string.IsNullOrEmpty(targetType))
-                                ImGui.Text($"Type: {targetType.Split('.').Last()}");
-                            ImGui.EndTooltip();
-                        }
+                // Float interpretation
+                ImGui.TableNextColumn();
+                if (field.Size >= 4 && interp.AsFloat != null)
+                {
+                    if (interp.FloatIsInvalid)
+                        ImGui.TextColored(new Vector4(0.4f, 0.4f, 0.4f, 1.0f), "NaN");
+                    else
+                        ImGui.Text(interp.AsFloat);
+                }
+                else
+                {
+                    ImGui.TextColored(new Vector4(0.4f, 0.4f, 0.4f, 1.0f), "-");
+                }
+
+                // Pointer interpretation
+                ImGui.TableNextColumn();
+                if (field.Size >= 8 && interp.AsPointer != null)
+                {
+                    if (interp.IsValidPointer)
+                        ImGui.TextColored(new Vector4(0.6f, 0.8f, 1.0f, 1.0f), "valid");
+                    else if (interp.PointerValue == 0)
+                        ImGui.TextColored(new Vector4(0.4f, 0.4f, 0.4f, 1.0f), "null");
+                    else
+                        ImGui.TextColored(new Vector4(0.4f, 0.4f, 0.4f, 1.0f), "inv");
+                }
+                else
+                {
+                    ImGui.TextColored(new Vector4(0.4f, 0.4f, 0.4f, 1.0f), "-");
+                }
+
+                // Declared name/type
+                ImGui.TableNextColumn();
+                if (field.HasMatch)
+                {
+                    ImGui.Text(field.DeclaredName ?? "");
+                    if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(field.DeclaredType))
+                    {
+                        ImGui.SetTooltip(field.DeclaredType);
+                    }
+                }
+                else
+                {
+                    ImGui.TextColored(new Vector4(0.4f, 0.4f, 0.4f, 1.0f), "-");
+                }
+
+                // Navigate button for valid pointers
+                ImGui.TableNextColumn();
+                if (interp.IsValidPointer && interp.PointerValue != 0)
+                {
+                    if (ImGui.SmallButton($"->##nav{field.Offset}"))
+                    {
+                        var targetType = TryResolvePointerType(field);
+                        var targetSize = GetPointerTargetSize(targetType);
+                        NavigateTo(
+                            interp.PointerValue,
+                            targetSize,
+                            targetType,
+                            field.DeclaredName ?? $"0x{field.Offset:X}",
+                            field.Offset);
+                    }
+                    if (ImGui.IsItemHovered())
+                    {
+                        ImGui.SetTooltip($"Navigate to 0x{interp.PointerValue:X}");
+                    }
+                }
+
+                // Watch button
+                ImGui.TableNextColumn();
+                var isWatching = changeMonitor.IsWatching(address);
+                if (isWatching)
+                {
+                    if (ImGui.SmallButton($"-##unwatch{field.Offset}"))
+                    {
+                        changeMonitor.UnwatchAddress(address);
+                    }
+                    if (ImGui.IsItemHovered())
+                    {
+                        ImGui.SetTooltip("Stop watching");
+                    }
+                }
+                else
+                {
+                    if (ImGui.SmallButton($"+##watch{field.Offset}"))
+                    {
+                        var label = field.DeclaredName ?? $"0x{field.Offset:X}";
+                        changeMonitor.WatchAddress(address, field.Size, label);
+                    }
+                    if (ImGui.IsItemHovered())
+                    {
+                        ImGui.SetTooltip("Watch for changes");
                     }
                 }
 
@@ -1091,69 +1203,100 @@ public class MemoryExplorerWindow : Window, IDisposable
 
     private void DrawFieldDetails()
     {
-        if (selectedField == null)
+        if (selectedField == null || currentNavigation == null)
         {
             ImGui.TextWrapped("Select a field from the list to view details.");
             return;
         }
 
         var field = selectedField;
+        var address = currentNavigation.Address + field.Offset;
+        var interp = TypeInference.GetInterpretations(address, Math.Min(field.Size, 8));
 
         // Header
         ImGui.TextColored(new Vector4(0.8f, 0.8f, 1.0f, 1.0f), $"Field at offset 0x{field.Offset:X}");
-        ImGui.Separator();
-
-        // Basic info
-        ImGui.Text($"Inferred Type: {field.TypeString}");
+        ImGui.Text($"Address: 0x{address:X}");
         ImGui.Text($"Size: {field.Size} bytes");
-        ImGui.Text($"Confidence: {field.Confidence:P1}");
-
-        if (!string.IsNullOrEmpty(field.Notes))
-        {
-            ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), $"Notes: {field.Notes}");
-        }
 
         ImGui.Separator();
 
-        // Declared info
+        // Declared info (from FFXIVClientStructs)
         if (field.HasMatch)
         {
-            ImGui.TextColored(new Vector4(0.5f, 1.0f, 0.5f, 1.0f), "Matches FFXIVClientStructs:");
+            ImGui.TextColored(new Vector4(0.5f, 1.0f, 0.5f, 1.0f), "Declared (FFXIVClientStructs):");
             ImGui.Indent();
             ImGui.Text($"Name: {field.DeclaredName}");
             ImGui.Text($"Type: {field.DeclaredType}");
             ImGui.Unindent();
         }
-        else if (field.InferredType != InferredTypeKind.Padding)
+        else
         {
-            ImGui.TextColored(new Vector4(1.0f, 1.0f, 0.5f, 1.0f), "Not in FFXIVClientStructs (undocumented)");
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1.0f), "No declared field at this offset");
         }
 
         ImGui.Separator();
 
-        // Value
-        if (!string.IsNullOrEmpty(field.Value))
+        // All interpretations (shown equally)
+        ImGui.Text("All Interpretations:");
+        ImGui.Indent();
+
+        ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), $"Hex: {interp.HexString}");
+
+        if (interp.AsInt8 != null)
+            ImGui.Text($"Int8: {interp.AsInt8}  |  UInt8: {interp.AsUInt8}");
+        if (interp.AsInt16 != null)
+            ImGui.Text($"Int16: {interp.AsInt16}  |  UInt16: {interp.AsUInt16}");
+        if (interp.AsInt32 != null)
+            ImGui.Text($"Int32: {interp.AsInt32}  |  UInt32: {interp.AsUInt32}");
+        if (interp.AsInt64 != null)
+            ImGui.Text($"Int64: {interp.AsInt64}");
+        if (interp.AsFloat != null)
         {
-            ImGui.Text($"Value: {field.Value}");
+            if (interp.FloatIsInvalid)
+                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1.0f), "Float: (NaN/Infinity)");
+            else
+                ImGui.Text($"Float: {interp.AsFloat}");
+        }
+        if (interp.AsDouble != null)
+            ImGui.Text($"Double: {interp.AsDouble}");
+        if (interp.AsPointer != null)
+        {
+            var ptrColor = interp.IsValidPointer
+                ? new Vector4(0.6f, 0.8f, 1.0f, 1.0f)
+                : new Vector4(0.5f, 0.5f, 0.5f, 1.0f);
+            ImGui.TextColored(ptrColor, $"Pointer: {interp.AsPointer}");
+            if (interp.IsValidPointer && !string.IsNullOrEmpty(interp.PointerTargetDescription))
+            {
+                ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1.0f), $"  -> {interp.PointerTargetDescription}");
+            }
         }
 
-        // Pointer target with explore button
-        if (field.PointerTarget.HasValue && field.PointerTarget.Value != 0)
+        ImGui.Unindent();
+
+        // Factual observations
+        if (interp.IsAllZeros || interp.IsDebugPattern)
         {
-            ImGui.Text($"Points to: 0x{field.PointerTarget.Value:X}");
+            ImGui.Separator();
+            ImGui.Text("Observations:");
+            ImGui.Indent();
+            if (interp.IsAllZeros)
+                ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1.0f), "All zeros");
+            if (interp.IsDebugPattern)
+                ImGui.TextColored(new Vector4(1.0f, 0.6f, 0.3f, 1.0f), "Debug/uninitialized pattern");
+            ImGui.Unindent();
+        }
 
-            var targetType = TryResolvePointerType(field);
-            if (!string.IsNullOrEmpty(targetType))
-            {
-                ImGui.Text($"Target type: {targetType.Split('.').Last()}");
-            }
+        ImGui.Separator();
 
-            ImGui.Spacing();
-            if (ImGui.Button($"Explore Target##exploreDetail"))
+        // Actions
+        if (interp.IsValidPointer && interp.PointerValue != 0)
+        {
+            if (ImGui.Button("Navigate to Pointer Target"))
             {
+                var targetType = TryResolvePointerType(field);
                 var targetSize = GetPointerTargetSize(targetType);
                 NavigateTo(
-                    field.PointerTarget.Value,
+                    interp.PointerValue,
                     targetSize,
                     targetType,
                     field.DeclaredName ?? $"0x{field.Offset:X}",
@@ -1161,18 +1304,22 @@ public class MemoryExplorerWindow : Window, IDisposable
             }
         }
 
-        ImGui.Separator();
-
-        // Raw bytes
-        if (field.RawBytes != null && field.RawBytes.Length > 0)
+        // Watch button
+        var isWatching = changeMonitor.IsWatching(address);
+        if (isWatching)
         {
-            ImGui.Text("Raw Bytes:");
-            ImGui.Indent();
-
-            var hexStr = string.Join(" ", field.RawBytes.Select(b => $"{b:X2}"));
-            ImGui.TextColored(new Vector4(0.8f, 0.8f, 0.8f, 1.0f), hexStr);
-
-            ImGui.Unindent();
+            if (ImGui.Button("Stop Watching"))
+            {
+                changeMonitor.UnwatchAddress(address);
+            }
+        }
+        else
+        {
+            if (ImGui.Button("Watch for Changes"))
+            {
+                var label = field.DeclaredName ?? $"0x{field.Offset:X}";
+                changeMonitor.WatchAddress(address, field.Size, label);
+            }
         }
     }
 
@@ -1243,20 +1390,15 @@ public class MemoryExplorerWindow : Window, IDisposable
             foreach (var field in currentLayout.Fields.Where(f => f.InferredType != InferredTypeKind.Padding))
             {
                 var name = field.DeclaredName ?? $"Unknown_0x{field.Offset:X}";
-                var type = MapToYamlType(field);
+                var type = field.HasMatch ? field.DeclaredType ?? MapToYamlType(field) : MapToYamlType(field);
 
                 writer.WriteLine($"      - type: {type}");
                 writer.WriteLine($"        name: {name}");
                 writer.WriteLine($"        offset: 0x{field.Offset:X}");
 
-                if (field.Confidence < 0.7f)
+                if (!field.HasMatch)
                 {
-                    writer.WriteLine($"        # confidence: {field.Confidence:P0}");
-                }
-
-                if (!string.IsNullOrEmpty(field.Notes))
-                {
-                    writer.WriteLine($"        # {field.Notes}");
+                    writer.WriteLine($"        # Not in FFXIVClientStructs - type is unknown");
                 }
             }
 
@@ -1265,6 +1407,30 @@ public class MemoryExplorerWindow : Window, IDisposable
         catch (Exception ex)
         {
             statusMessage = $"Export failed: {ex.Message}";
+        }
+    }
+
+    private void ExportToReClass()
+    {
+        if (currentLayout == null) return;
+
+        try
+        {
+            var exporter = new ReClassExporter();
+            var rcnet = exporter.ExportToRcnet(currentLayout);
+
+            var structName = currentLayout.StructName.Split('.').LastOrDefault() ?? "Unknown";
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                $"reclass-{structName}-{DateTime.Now:yyyyMMdd-HHmmss}.rcnet"
+            );
+
+            File.WriteAllText(path, rcnet);
+            statusMessage = $"Exported ReClass project to {path}";
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"ReClass export failed: {ex.Message}";
         }
     }
 

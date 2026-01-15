@@ -70,7 +70,11 @@ public class InferredType
 }
 
 /// <summary>
-/// Infers types from memory values using heuristics.
+/// Provides type interpretations for memory values.
+///
+/// IMPORTANT: This class provides multiple INTERPRETATIONS of bytes, not type DETECTION.
+/// The same bytes can validly represent many different types (int, float, pointer, etc.).
+/// Only code analysis can determine the actual type - not value inspection.
 /// </summary>
 public static unsafe class TypeInference
 {
@@ -80,8 +84,130 @@ public static unsafe class TypeInference
     private const uint AlignmentPattern = 0xFDFDFDFD;
 
     /// <summary>
+    /// Get all valid interpretations of bytes at the given address.
+    /// All interpretations are shown equally - no "preferred" type is claimed.
+    /// </summary>
+    /// <param name="address">Memory address to read from.</param>
+    /// <param name="maxSize">Maximum bytes to interpret (1-8).</param>
+    /// <returns>All valid interpretations of the bytes.</returns>
+    public static ByteInterpretations GetInterpretations(nint address, int maxSize = 8)
+    {
+        var result = new ByteInterpretations { Size = maxSize };
+
+        // Read raw bytes
+        if (!SafeMemoryReader.TryReadBytes(address, Math.Min(maxSize, 8), out var bytes))
+        {
+            result.RawBytes = Array.Empty<byte>();
+            result.HexString = "(unreadable)";
+            return result;
+        }
+
+        result.RawBytes = bytes;
+        result.HexString = BitConverter.ToString(bytes).Replace("-", " ");
+
+        // Factual observations
+        result.IsAllZeros = IsAllZeros(bytes);
+        if (bytes.Length >= 4)
+        {
+            var uint32 = BitConverter.ToUInt32(bytes, 0);
+            result.IsDebugPattern = uint32 is UninitializedPattern or FreedPattern or AlignmentPattern;
+        }
+
+        // 1-byte interpretations
+        if (bytes.Length >= 1)
+        {
+            result.AsInt8 = ((sbyte)bytes[0]).ToString();
+            result.AsUInt8 = bytes[0].ToString();
+        }
+
+        // 2-byte interpretations
+        if (bytes.Length >= 2)
+        {
+            result.AsInt16 = BitConverter.ToInt16(bytes, 0).ToString();
+            result.AsUInt16 = BitConverter.ToUInt16(bytes, 0).ToString();
+        }
+
+        // 4-byte interpretations
+        if (bytes.Length >= 4)
+        {
+            result.AsInt32 = BitConverter.ToInt32(bytes, 0).ToString();
+            result.AsUInt32 = BitConverter.ToUInt32(bytes, 0).ToString();
+
+            var floatVal = BitConverter.ToSingle(bytes, 0);
+            result.FloatIsInvalid = float.IsNaN(floatVal) || float.IsInfinity(floatVal);
+            result.AsFloat = result.FloatIsInvalid ? "(invalid)" : floatVal.ToString("G6");
+        }
+
+        // 8-byte interpretations
+        if (bytes.Length >= 8)
+        {
+            result.AsInt64 = BitConverter.ToInt64(bytes, 0).ToString();
+            result.AsUInt64 = BitConverter.ToUInt64(bytes, 0).ToString();
+
+            var doubleVal = BitConverter.ToDouble(bytes, 0);
+            var doubleInvalid = double.IsNaN(doubleVal) || double.IsInfinity(doubleVal);
+            result.AsDouble = doubleInvalid ? "(invalid)" : doubleVal.ToString("G6");
+
+            // Pointer interpretation
+            var ptrValue = BitConverter.ToInt64(bytes, 0);
+            result.PointerValue = (nint)ptrValue;
+            if (ptrValue != 0)
+            {
+                var ptrInfo = PointerValidator.Validate((nint)ptrValue);
+                result.IsValidPointer = ptrInfo.Result is PointerValidationResult.ValidHeap
+                    or PointerValidationResult.ValidCode
+                    or PointerValidationResult.ValidData;
+
+                if (result.IsValidPointer)
+                {
+                    result.AsPointer = $"0x{ptrValue:X}";
+                    result.PointerTargetDescription = ptrInfo.TargetDescription;
+                }
+                else
+                {
+                    result.AsPointer = $"0x{ptrValue:X} (invalid)";
+                }
+            }
+            else
+            {
+                result.AsPointer = "null";
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Get detailed information about a pointer target.
+    /// </summary>
+    public static PointerTargetInfo GetPointerTargetInfo(nint address)
+    {
+        var info = new PointerTargetInfo { Address = address };
+
+        if (address == 0)
+        {
+            info.RegionDescription = "null";
+            return info;
+        }
+
+        var validation = PointerValidator.Validate(address);
+        info.IsReadable = validation.Result != PointerValidationResult.Invalid;
+        info.IsInCodeSection = PointerValidator.IsInCodeSection(address);
+        info.IsInHeap = validation.Result == PointerValidationResult.ValidHeap;
+        info.IsInDataSection = validation.Result == PointerValidationResult.ValidData;
+        info.RegionDescription = validation.TargetDescription;
+
+        return info;
+    }
+
+    /// <summary>
     /// Infer the type of a value at the given address with specified size hint.
     /// </summary>
+    /// <remarks>
+    /// DEPRECATED: This method uses confidence scores which create false precision.
+    /// Prefer <see cref="GetInterpretations"/> which shows all interpretations equally.
+    /// </remarks>
+    [Obsolete("Use GetInterpretations() instead - confidence-based inference is unreliable")]
     public static InferredType InferType(nint address, int sizeHint)
     {
         if (!SafeMemoryReader.TryReadBytes(address, Math.Min(sizeHint, 8), out var bytes))
