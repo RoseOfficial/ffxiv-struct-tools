@@ -7,6 +7,7 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
+using StructValidator.Memory;
 using StructValidator.UI;
 
 namespace StructValidator;
@@ -22,6 +23,7 @@ public sealed class Plugin : IDalamudPlugin
     private const string CommandRunAll = "/structvalall";
     private const string CommandExport = "/structvalexport";
     private const string CommandExplore = "/structexplore";
+    private const string CommandRefresh = "/structvalrefresh";
 
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commandManager;
@@ -49,6 +51,11 @@ public sealed class Plugin : IDalamudPlugin
         this.configuration.Initialize(pluginInterface);
 
         this.validationEngine = new StructValidationEngine(pluginLog);
+
+        // Build VTable cache for type resolution
+        var vtableCount = TypeResolver.BuildVTableCache();
+        pluginLog.Info($"Built VTable cache with {vtableCount} type mappings");
+
         this.mainWindow = new MainWindow(this, validationEngine, configuration);
         this.memoryExplorerWindow = new MemoryExplorerWindow(validationEngine, configuration);
 
@@ -75,6 +82,11 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Open the Memory Explorer to discover struct layouts"
         });
 
+        commandManager.AddHandler(CommandRefresh, new CommandInfo(OnRefreshCommand)
+        {
+            HelpMessage = "Rebuild the VTable type cache"
+        });
+
         pluginInterface.UiBuilder.Draw += DrawUI;
         pluginInterface.UiBuilder.OpenConfigUi += OnOpenConfigUi;
     }
@@ -89,6 +101,7 @@ public sealed class Plugin : IDalamudPlugin
         commandManager.RemoveHandler(CommandRunAll);
         commandManager.RemoveHandler(CommandExport);
         commandManager.RemoveHandler(CommandExplore);
+        commandManager.RemoveHandler(CommandRefresh);
     }
 
     private void OnCommand(string command, string args)
@@ -99,6 +112,14 @@ public sealed class Plugin : IDalamudPlugin
     private void OnExploreCommand(string command, string args)
     {
         memoryExplorerWindow.IsOpen = true;
+    }
+
+    private void OnRefreshCommand(string command, string args)
+    {
+        chatGui.Print("[StructValidator] Refreshing VTable cache...");
+        TypeResolver.ClearVTableCache();
+        var count = TypeResolver.BuildVTableCache();
+        chatGui.Print($"[StructValidator] VTable cache rebuilt with {count} type mappings");
     }
 
     private void OnRunAllCommand(string command, string args)

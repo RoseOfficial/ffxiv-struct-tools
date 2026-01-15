@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using Dalamud.Plugin.Services;
+using StructValidator.Memory;
 
 namespace StructValidator;
 
@@ -15,6 +16,10 @@ public unsafe class StructValidationEngine
     private readonly IPluginLog pluginLog;
     private Assembly? clientStructsAssembly;
     private string? initError;
+
+    // Nested struct recursion limits
+    private const int MaxRecursionDepth = 3;
+    private const int MaxNestedStructSize = 1024; // 1KB limit for nested structs
 
     public StructValidationEngine(IPluginLog pluginLog)
     {
@@ -189,17 +194,45 @@ public unsafe class StructValidationEngine
         });
 
         // Validate fields by reading memory
-        ValidateStructFields(ptr, structType, result);
+        ValidateStructFields(basePtr: ptr, structType: structType, fieldValidations: result.FieldValidations!, issues: result.Issues);
 
         result.Passed = !result.Issues.Any(i => i.Severity == "error");
+
+        // Try to get struct size
+        try
+        {
+            result.ActualSize = Marshal.SizeOf(structType);
+        }
+        catch { }
+
+        // Check for declared size
+        var layoutAttr = structType.GetCustomAttribute<StructLayoutAttribute>();
+        if (layoutAttr?.Size > 0)
+        {
+            result.DeclaredSize = layoutAttr.Size;
+        }
+
         return result;
     }
 
     /// <summary>
-    /// Read and validate struct fields from memory.
+    /// Read and validate struct fields from memory with optional recursion for nested structs.
     /// </summary>
-    private void ValidateStructFields(nint basePtr, Type structType, StructValidationResult result)
+    private void ValidateStructFields(
+        nint basePtr,
+        Type structType,
+        List<FieldValidation> fieldValidations,
+        List<ValidationIssue> issues,
+        int depth = 0,
+        HashSet<nint>? visited = null)
     {
+        // Initialize visited set at top level
+        visited ??= new HashSet<nint>();
+
+        // Cycle detection
+        if (!visited.Add(basePtr))
+            return;
+
         // Get all fields including inherited ones by walking the type hierarchy
         var fields = GetAllFields(structType);
 
@@ -242,7 +275,7 @@ public unsafe class StructValidationEngine
                     // Validate float is not NaN or Infinity
                     if (float.IsNaN(value) || float.IsInfinity(value))
                     {
-                        result.Issues.Add(new ValidationIssue
+                        issues.Add(new ValidationIssue
                         {
                             Severity = "warning",
                             Rule = "invalid-float",
@@ -292,6 +325,16 @@ public unsafe class StructValidationEngine
                     nint value = *(nint*)(basePtr + offset);
                     validation.Value = value == 0 ? "null" : $"0x{value:X}";
                     validation.Size = 8;
+
+                    // Try to resolve pointer target type via vtable
+                    if (value != 0 && depth < MaxRecursionDepth)
+                    {
+                        var resolvedType = TypeResolver.ResolveFromVTable(value);
+                        if (resolvedType != null)
+                        {
+                            validation.ResolvedTypeName = resolvedType.Name;
+                        }
+                    }
                 }
                 else if (fieldType.IsEnum)
                 {
@@ -314,9 +357,64 @@ public unsafe class StructValidationEngine
                         validation.Size = Marshal.SizeOf(underlyingType);
                     }
                 }
+                else if (fieldType.IsValueType && !fieldType.IsPrimitive)
+                {
+                    // Nested struct type - try to recurse
+                    int structSize;
+                    try
+                    {
+                        structSize = Marshal.SizeOf(fieldType);
+                    }
+                    catch
+                    {
+                        structSize = 0;
+                    }
+
+                    validation.Size = structSize;
+
+                    // Check if we should recurse into this struct
+                    bool shouldRecurse = depth < MaxRecursionDepth &&
+                                         structSize > 0 &&
+                                         structSize <= MaxNestedStructSize &&
+                                         IsFFXIVClientStructsType(fieldType);
+
+                    if (shouldRecurse)
+                    {
+                        validation.ResolvedTypeName = fieldType.Name;
+                        validation.NestedFields = new List<FieldValidation>();
+
+                        // Recursively validate nested struct fields
+                        ValidateStructFields(
+                            basePtr: basePtr + offset,
+                            structType: fieldType,
+                            fieldValidations: validation.NestedFields,
+                            issues: issues,
+                            depth: depth + 1,
+                            visited: visited);
+
+                        // Create summary value from nested fields
+                        if (validation.NestedFields.Count > 0)
+                        {
+                            var preview = string.Join(", ", validation.NestedFields
+                                .Take(3)
+                                .Select(f => $"{f.Name}={f.Value}"));
+                            if (validation.NestedFields.Count > 3)
+                                preview += ", ...";
+                            validation.Value = $"{{{preview}}}";
+                        }
+                        else
+                        {
+                            validation.Value = $"({fieldType.Name})";
+                        }
+                    }
+                    else
+                    {
+                        validation.Value = $"({fieldType.Name})";
+                    }
+                }
                 else
                 {
-                    // Complex/nested type - just note it exists
+                    // Unknown type
                     try
                     {
                         validation.Size = Marshal.SizeOf(fieldType);
@@ -325,14 +423,14 @@ public unsafe class StructValidationEngine
                     {
                         validation.Size = 0;
                     }
-                    validation.Value = "(complex)";
+                    validation.Value = "(unknown)";
                 }
 
-                result.FieldValidations.Add(validation);
+                fieldValidations.Add(validation);
             }
             catch (Exception ex)
             {
-                result.Issues.Add(new ValidationIssue
+                issues.Add(new ValidationIssue
                 {
                     Severity = "warning",
                     Rule = "field-read-error",
@@ -341,20 +439,14 @@ public unsafe class StructValidationEngine
                 });
             }
         }
+    }
 
-        // Try to get struct size
-        try
-        {
-            result.ActualSize = Marshal.SizeOf(structType);
-        }
-        catch { }
-
-        // Check for declared size
-        var layoutAttr = structType.GetCustomAttribute<StructLayoutAttribute>();
-        if (layoutAttr?.Size > 0)
-        {
-            result.DeclaredSize = layoutAttr.Size;
-        }
+    /// <summary>
+    /// Check if a type is from FFXIVClientStructs namespace.
+    /// </summary>
+    private bool IsFFXIVClientStructsType(Type type)
+    {
+        return type.Namespace?.StartsWith("FFXIVClientStructs") == true;
     }
 
     /// <summary>
@@ -413,8 +505,9 @@ public unsafe class StructValidationEngine
             return ex.Types
                 .Where(t => t != null &&
                            t.Namespace?.StartsWith("FFXIVClientStructs") == true &&
-                           t.GetMethod("Instance", BindingFlags.Static | BindingFlags.Public) != null)!
-                .OrderBy(t => t!.FullName);
+                           t.GetMethod("Instance", BindingFlags.Static | BindingFlags.Public) != null)
+                .Cast<Type>()
+                .OrderBy(t => t.FullName);
         }
     }
 

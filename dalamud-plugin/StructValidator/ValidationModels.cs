@@ -67,4 +67,14 @@ public class FieldValidation
     public string Type { get; set; } = "";
     public int Size { get; set; }
     public string? Value { get; set; }
+
+    /// <summary>
+    /// For struct fields, contains the nested field validations.
+    /// </summary>
+    public List<FieldValidation>? NestedFields { get; set; }
+
+    /// <summary>
+    /// If this field points to a known struct type.
+    /// </summary>
+    public string? ResolvedTypeName { get; set; }
 }

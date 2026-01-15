@@ -16,6 +16,10 @@ public static class TypeResolver
     private static List<Type>? cachedStructTypes;
     private static bool initialized;
 
+    // VTable address → Type mapping cache
+    private static readonly Dictionary<nint, Type> vtableToTypeCache = new();
+    private static bool vtableCacheBuilt;
+
     /// <summary>
     /// Initialize the type resolver by finding the FFXIVClientStructs assembly.
     /// </summary>
@@ -162,10 +166,181 @@ public static class TypeResolver
         if (!SafeMemoryReader.TryReadPointer(address, out var vtable) || vtable == 0)
             return null;
 
-        // This is a placeholder for more sophisticated vtable matching.
-        // A full implementation would build a map of vtable addresses to types
-        // by analyzing the game binary or caching discovered mappings.
+        // Look up in our cache
+        if (vtableToTypeCache.TryGetValue(vtable, out var type))
+            return type;
+
         return null;
+    }
+
+    /// <summary>
+    /// Build the vtable→type cache by iterating all singleton types.
+    /// Call this during plugin initialization.
+    /// </summary>
+    public static int BuildVTableCache()
+    {
+        if (vtableCacheBuilt)
+            return vtableToTypeCache.Count;
+
+        Initialize();
+
+        if (clientStructsAssembly == null)
+            return 0;
+
+        int added = 0;
+
+        try
+        {
+            // Find all types with Instance() methods
+            var singletonTypes = GetSingletonTypes().ToList();
+
+            foreach (var type in singletonTypes)
+            {
+                try
+                {
+                    var ptr = GetInstancePointer(type);
+                    if (ptr == 0)
+                        continue;
+
+                    // Read vtable pointer at offset 0
+                    if (!SafeMemoryReader.TryReadPointer(ptr, out var vtableAddr) || vtableAddr == 0)
+                        continue;
+
+                    // Only add if we haven't seen this vtable yet
+                    if (!vtableToTypeCache.ContainsKey(vtableAddr))
+                    {
+                        vtableToTypeCache[vtableAddr] = type;
+                        added++;
+                    }
+                }
+                catch
+                {
+                    // Skip types that fail
+                }
+            }
+        }
+        catch
+        {
+            // Ignore errors during cache building
+        }
+
+        vtableCacheBuilt = true;
+        return added;
+    }
+
+    /// <summary>
+    /// Get all types with static Instance() methods (singletons).
+    /// </summary>
+    public static IEnumerable<Type> GetSingletonTypes()
+    {
+        Initialize();
+
+        if (clientStructsAssembly == null)
+            return Enumerable.Empty<Type>();
+
+        try
+        {
+            return clientStructsAssembly.GetTypes()
+                .Where(t => t.Namespace?.StartsWith("FFXIVClientStructs") == true &&
+                           t.GetMethod("Instance", BindingFlags.Static | BindingFlags.Public) != null)
+                .OrderBy(t => t.FullName);
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            return ex.Types
+                .Where(t => t != null &&
+                           t.Namespace?.StartsWith("FFXIVClientStructs") == true &&
+                           t.GetMethod("Instance", BindingFlags.Static | BindingFlags.Public) != null)!
+                .Cast<Type>()
+                .OrderBy(t => t.FullName);
+        }
+    }
+
+    /// <summary>
+    /// Get the instance pointer for a singleton type.
+    /// </summary>
+    private static nint GetInstancePointer(Type type)
+    {
+        var instanceMethod = type.GetMethod("Instance", BindingFlags.Static | BindingFlags.Public);
+        if (instanceMethod == null)
+            return 0;
+
+        try
+        {
+            var returnType = instanceMethod.ReturnType;
+
+            if (returnType.IsPointer)
+            {
+                // Create delegate and call it
+                var del = Delegate.CreateDelegate(typeof(Func<nint>), instanceMethod, false);
+                if (del != null)
+                    return ((Func<nint>)del)();
+
+                // Fallback: use function pointer
+                var funcPtr = instanceMethod.MethodHandle.GetFunctionPointer();
+                unsafe
+                {
+                    var func = (delegate* unmanaged<nint>)funcPtr;
+                    return func();
+                }
+            }
+            else
+            {
+                // Non-pointer return - try to extract pointer value
+                var result = instanceMethod.Invoke(null, null);
+                return ExtractPointerValue(result);
+            }
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Extract pointer value from various wrapper types.
+    /// </summary>
+    private static nint ExtractPointerValue(object? value)
+    {
+        if (value == null)
+            return 0;
+
+        var valueType = value.GetType();
+
+        if (valueType == typeof(nint) || valueType == typeof(IntPtr))
+            return (nint)value;
+
+        if (valueType == typeof(nuint) || valueType == typeof(UIntPtr))
+            return (nint)(nuint)value;
+
+        // Try Pointer<T>.Value property
+        var valueProperty = valueType.GetProperty("Value");
+        if (valueProperty != null)
+        {
+            var ptrValue = valueProperty.GetValue(value);
+            return ExtractPointerValue(ptrValue);
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Get the number of cached vtable mappings.
+    /// </summary>
+    public static int GetVTableCacheCount() => vtableToTypeCache.Count;
+
+    /// <summary>
+    /// Check if a vtable address is in the cache.
+    /// </summary>
+    public static bool IsVTableKnown(nint vtableAddress) => vtableToTypeCache.ContainsKey(vtableAddress);
+
+    /// <summary>
+    /// Clear the vtable cache (useful for refreshing after game updates).
+    /// </summary>
+    public static void ClearVTableCache()
+    {
+        vtableToTypeCache.Clear();
+        vtableCacheBuilt = false;
     }
 
     /// <summary>

@@ -378,21 +378,90 @@ public class MainWindow : Window, IDisposable
 
                 foreach (var field in result.FieldValidations)
                 {
-                    ImGui.TableNextRow();
-                    ImGui.TableNextColumn();
-                    ImGui.Text(field.Name);
-                    ImGui.TableNextColumn();
-                    ImGui.Text($"0x{field.Offset:X}");
-                    ImGui.TableNextColumn();
-                    ImGui.Text(field.Type);
-                    ImGui.TableNextColumn();
-                    ImGui.Text($"{field.Size}");
-                    ImGui.TableNextColumn();
-                    ImGui.Text(field.Value ?? "");
+                    DrawFieldRow(field, 0);
                 }
 
                 ImGui.EndTable();
             }
+        }
+    }
+
+    /// <summary>
+    /// Recursively draws a field row and its nested fields with tree expansion support.
+    /// </summary>
+    private void DrawFieldRow(FieldValidation field, int depth)
+    {
+        var hasNestedFields = field.NestedFields != null && field.NestedFields.Count > 0;
+        var indent = depth * 20; // Pixels per indent level
+
+        ImGui.TableNextRow();
+        ImGui.TableNextColumn();
+
+        // Add indentation for nested fields
+        if (depth > 0)
+        {
+            ImGui.Indent(indent);
+        }
+
+        if (hasNestedFields)
+        {
+            // Use tree node for expandable struct fields
+            var nodeFlags = ImGuiTreeNodeFlags.SpanFullWidth;
+            var isOpen = ImGui.TreeNodeEx($"{field.Name}##{field.Offset}", nodeFlags);
+
+            if (depth > 0)
+            {
+                ImGui.Unindent(indent);
+            }
+
+            // Draw remaining columns
+            ImGui.TableNextColumn();
+            ImGui.Text($"0x{field.Offset:X}");
+            ImGui.TableNextColumn();
+
+            // Show resolved type name if available, otherwise original type
+            if (!string.IsNullOrEmpty(field.ResolvedTypeName))
+            {
+                ImGui.TextColored(new Vector4(0.6f, 0.8f, 1.0f, 1.0f), field.ResolvedTypeName);
+            }
+            else
+            {
+                ImGui.Text(field.Type);
+            }
+
+            ImGui.TableNextColumn();
+            ImGui.Text($"{field.Size}");
+            ImGui.TableNextColumn();
+            ImGui.Text(field.Value ?? "(struct)");
+
+            // Recursively draw nested fields if expanded
+            if (isOpen)
+            {
+                foreach (var nestedField in field.NestedFields!)
+                {
+                    DrawFieldRow(nestedField, depth + 1);
+                }
+                ImGui.TreePop();
+            }
+        }
+        else
+        {
+            // Simple text for leaf fields
+            ImGui.Text(field.Name);
+
+            if (depth > 0)
+            {
+                ImGui.Unindent(indent);
+            }
+
+            ImGui.TableNextColumn();
+            ImGui.Text($"0x{field.Offset:X}");
+            ImGui.TableNextColumn();
+            ImGui.Text(field.Type);
+            ImGui.TableNextColumn();
+            ImGui.Text($"{field.Size}");
+            ImGui.TableNextColumn();
+            ImGui.Text(field.Value ?? "");
         }
     }
 

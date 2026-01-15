@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 
 namespace StructValidator.Memory;
@@ -115,13 +116,23 @@ public static unsafe class TypeInference
                         };
                     }
 
-                    // Check if it points to a string
+                    // Check if it points to a string (UTF-8 supported)
                     if (TryReadStringAt(ptrValue, out var str))
                     {
                         return new InferredType(InferredTypeKind.StringPointer, 0.85f, 8)
                         {
                             DisplayValue = $"\"{TruncateString(str, 32)}\"",
                             Notes = $"String pointer: {str.Length} chars"
+                        };
+                    }
+
+                    // Check if this looks like a Utf8String struct
+                    if (TryDetectUtf8StringStruct(ptrValue, out var utf8Str, out var utf8Conf))
+                    {
+                        return new InferredType(InferredTypeKind.Utf8String, utf8Conf, 8)
+                        {
+                            DisplayValue = $"\"{TruncateString(utf8Str, 32)}\"",
+                            Notes = $"Utf8String: {utf8Str.Length} chars"
                         };
                     }
 
@@ -306,7 +317,7 @@ public static unsafe class TypeInference
     }
 
     /// <summary>
-    /// Try to read a null-terminated string at an address.
+    /// Try to read a null-terminated string at an address, supporting UTF-8.
     /// </summary>
     private static bool TryReadStringAt(nint address, out string result)
     {
@@ -317,8 +328,9 @@ public static unsafe class TypeInference
 
         try
         {
-            var sb = new StringBuilder();
-            int maxLen = 256;
+            const int maxLen = 512;
+            var bytes = new List<byte>();
+            int validChars = 0;
 
             for (int i = 0; i < maxLen; i++)
             {
@@ -327,23 +339,173 @@ public static unsafe class TypeInference
 
                 if (b == 0)
                 {
-                    // Valid null-terminated string
-                    if (sb.Length >= 2)
+                    // Null terminator found
+                    if (bytes.Count >= 2)
                     {
-                        result = sb.ToString();
-                        return true;
+                        try
+                        {
+                            result = Encoding.UTF8.GetString(bytes.ToArray());
+                            // Verify it decoded to reasonable text
+                            if (validChars >= 2 && !ContainsInvalidCharacters(result))
+                                return true;
+                        }
+                        catch
+                        {
+                            // Invalid UTF-8 sequence
+                        }
                     }
                     break;
                 }
 
-                // ASCII printable range
-                if (b is < 32 or > 126)
+                // Validate UTF-8 sequences
+                int seqLen = GetUtf8SequenceLength(b);
+                if (seqLen == 0)
                 {
-                    // Not ASCII - might be UTF-8, but for simplicity we stop
+                    // Invalid start byte
                     break;
                 }
 
-                sb.Append((char)b);
+                bytes.Add(b);
+
+                // Read continuation bytes for multi-byte sequences
+                if (seqLen > 1)
+                {
+                    bool validSequence = true;
+                    for (int j = 1; j < seqLen; j++)
+                    {
+                        if (!SafeMemoryReader.TryReadByte(address + i + j, out var cont))
+                        {
+                            validSequence = false;
+                            break;
+                        }
+
+                        // Continuation bytes must be 10xxxxxx
+                        if ((cont & 0xC0) != 0x80)
+                        {
+                            validSequence = false;
+                            break;
+                        }
+
+                        bytes.Add(cont);
+                    }
+
+                    if (!validSequence)
+                        break;
+
+                    i += seqLen - 1; // Advance past continuation bytes
+                }
+
+                validChars++;
+            }
+        }
+        catch
+        {
+            // Ignore
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Get the expected length of a UTF-8 sequence from its first byte.
+    /// Returns 0 for invalid start bytes.
+    /// </summary>
+    private static int GetUtf8SequenceLength(byte b)
+    {
+        // ASCII: 0xxxxxxx
+        if ((b & 0x80) == 0)
+            return 1;
+
+        // 2-byte: 110xxxxx
+        if ((b & 0xE0) == 0xC0)
+            return 2;
+
+        // 3-byte: 1110xxxx
+        if ((b & 0xF0) == 0xE0)
+            return 3;
+
+        // 4-byte: 11110xxx
+        if ((b & 0xF8) == 0xF0)
+            return 4;
+
+        // Continuation byte or invalid
+        return 0;
+    }
+
+    /// <summary>
+    /// Check if string contains characters that suggest it's not real text.
+    /// </summary>
+    private static bool ContainsInvalidCharacters(string s)
+    {
+        foreach (char c in s)
+        {
+            // Allow common printable characters, CJK, and other valid Unicode
+            if (char.IsControl(c) && c != '\t' && c != '\n' && c != '\r')
+                return true;
+
+            // Check for replacement character (indicates decoding failure)
+            if (c == '\uFFFD')
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Try to detect FFXIV's Utf8String struct pattern.
+    /// Layout: StringPtr(8) + BufSize(8) + BufUsed(8) + StringLength(8) + flags
+    /// </summary>
+    public static bool TryDetectUtf8StringStruct(nint address, out string result, out float confidence)
+    {
+        result = "";
+        confidence = 0;
+
+        if (!SafeMemoryReader.IsReadable(address))
+            return false;
+
+        try
+        {
+            // Read StringPtr at offset 0
+            if (!SafeMemoryReader.TryReadPointer(address, out var stringPtr))
+                return false;
+
+            if (stringPtr == 0)
+                return false;
+
+            // Validate pointer is readable
+            var ptrInfo = PointerValidator.Validate(stringPtr);
+            if (ptrInfo.Result != PointerValidationResult.ValidHeap &&
+                ptrInfo.Result != PointerValidationResult.ValidData)
+                return false;
+
+            // Read BufSize at offset 8
+            if (!SafeMemoryReader.TryReadInt64(address + 8, out var bufSize))
+                return false;
+
+            // Read StringLength at offset 0x18
+            if (!SafeMemoryReader.TryReadInt64(address + 0x18, out var stringLength))
+                return false;
+
+            // Validate sizes are reasonable
+            if (bufSize <= 0 || bufSize > 1024 * 1024) // Max 1MB
+                return false;
+
+            if (stringLength < 0 || stringLength > bufSize)
+                return false;
+
+            // Try to read the actual string
+            if (stringLength > 0 && TryReadStringAt(stringPtr, out result))
+            {
+                // Confidence based on how well sizes match
+                if (result.Length == stringLength ||
+                    Encoding.UTF8.GetByteCount(result) == stringLength)
+                {
+                    confidence = 0.9f;
+                }
+                else
+                {
+                    confidence = 0.7f;
+                }
+                return true;
             }
         }
         catch
