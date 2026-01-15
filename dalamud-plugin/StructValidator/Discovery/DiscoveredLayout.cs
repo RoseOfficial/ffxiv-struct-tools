@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json.Serialization;
 
 namespace StructValidator.Discovery;
 
@@ -16,7 +17,14 @@ public class DiscoveredLayout
     /// <summary>
     /// Base address where this struct instance was found.
     /// </summary>
+    [JsonIgnore]
     public nint BaseAddress { get; set; }
+
+    /// <summary>
+    /// Base address as hex string for JSON serialization.
+    /// </summary>
+    [JsonPropertyName("baseAddress")]
+    public string BaseAddressHex => $"0x{BaseAddress:X}";
 
     /// <summary>
     /// Total size analyzed.
@@ -36,7 +44,14 @@ public class DiscoveredLayout
     /// <summary>
     /// VTable address if detected at offset 0.
     /// </summary>
+    [JsonIgnore]
     public nint? VTableAddress { get; set; }
+
+    /// <summary>
+    /// VTable address as hex string for JSON serialization.
+    /// </summary>
+    [JsonPropertyName("vtableAddress")]
+    public string? VTableAddressHex => VTableAddress.HasValue ? $"0x{VTableAddress.Value:X}" : null;
 
     /// <summary>
     /// Number of vtable slots if vtable was detected.

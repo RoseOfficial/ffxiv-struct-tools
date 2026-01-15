@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using StructValidator.Memory;
@@ -189,7 +190,13 @@ public static class LayoutComparator
 
         layout.DeclaredSize = declared.DeclaredSize ?? declared.ActualSize;
 
-        var declaredByOffset = declared.FieldValidations.ToDictionary(f => f.Offset);
+        // Use first field at each offset (handles inheritance duplicates)
+        var declaredByOffset = new Dictionary<int, FieldValidation>();
+        foreach (var field in declared.FieldValidations)
+        {
+            if (!declaredByOffset.ContainsKey(field.Offset))
+                declaredByOffset[field.Offset] = field;
+        }
 
         foreach (var field in layout.Fields)
         {
@@ -197,11 +204,93 @@ public static class LayoutComparator
             {
                 field.DeclaredName = declaredField.Name;
                 field.DeclaredType = declaredField.Type;
+
+                // Re-read the value using the declared type for accurate display
+                var declaredValue = ReadValueAsType(layout.BaseAddress + field.Offset, declaredField.Type);
+                if (declaredValue != null)
+                {
+                    field.Value = declaredValue;
+                }
             }
         }
 
         // Update summary
         layout.Summary.MatchedFields = layout.Fields.Count(f => f.HasMatch);
         layout.Summary.UndocumentedFields = layout.Fields.Count(f => !f.HasMatch && f.InferredType != InferredTypeKind.Padding);
+    }
+
+    /// <summary>
+    /// Read a value from memory using the declared type name.
+    /// </summary>
+    private static string? ReadValueAsType(nint address, string? typeName)
+    {
+        if (string.IsNullOrEmpty(typeName))
+            return null;
+
+        var normalizedType = typeName.ToLowerInvariant()
+            .Replace("system.", "")
+            .Replace("int32", "int")
+            .Replace("int16", "short")
+            .Replace("int64", "long")
+            .Replace("uint32", "uint")
+            .Replace("uint16", "ushort")
+            .Replace("uint64", "ulong")
+            .Replace("single", "float")
+            .Replace("boolean", "bool");
+
+        try
+        {
+            if (normalizedType.Contains("byte") && !normalizedType.Contains("*"))
+            {
+                if (SafeMemoryReader.TryReadByte(address, out var value))
+                    return value.ToString();
+            }
+            else if (normalizedType.Contains("bool"))
+            {
+                if (SafeMemoryReader.TryReadByte(address, out var value))
+                    return (value != 0).ToString();
+            }
+            else if (normalizedType.Contains("short") || normalizedType == "int16")
+            {
+                if (SafeMemoryReader.TryReadInt16(address, out var value))
+                    return value.ToString();
+            }
+            else if (normalizedType.Contains("ushort") || normalizedType == "uint16")
+            {
+                if (SafeMemoryReader.TryReadInt16(address, out var value))
+                    return ((ushort)value).ToString();
+            }
+            else if (normalizedType.Contains("int") && !normalizedType.Contains("64") && !normalizedType.Contains("16") && !normalizedType.Contains("ptr"))
+            {
+                if (SafeMemoryReader.TryReadInt32(address, out var value))
+                    return value.ToString();
+            }
+            else if (normalizedType.Contains("uint") && !normalizedType.Contains("64") && !normalizedType.Contains("16"))
+            {
+                if (SafeMemoryReader.TryReadUInt32(address, out var value))
+                    return value.ToString();
+            }
+            else if (normalizedType.Contains("long") || normalizedType.Contains("int64"))
+            {
+                if (SafeMemoryReader.TryReadInt64(address, out var value))
+                    return value.ToString();
+            }
+            else if (normalizedType.Contains("float"))
+            {
+                if (SafeMemoryReader.TryReadFloat(address, out var value))
+                    return value.ToString("F4");
+            }
+            else if (normalizedType.Contains("*") || normalizedType.Contains("ptr") || normalizedType.Contains("pointer"))
+            {
+                if (SafeMemoryReader.TryReadPointer(address, out var value))
+                    return value == 0 ? "null" : $"0x{value:X}";
+            }
+        }
+        catch
+        {
+            // Ignore read errors
+        }
+
+        return null;
     }
 }

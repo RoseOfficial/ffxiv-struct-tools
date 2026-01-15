@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using StructValidator.Memory;
 
 namespace StructValidator.Discovery;
@@ -45,7 +46,14 @@ public class DiscoveredField
     /// <summary>
     /// If this is a pointer, the address it points to.
     /// </summary>
+    [JsonIgnore]
     public nint? PointerTarget { get; set; }
+
+    /// <summary>
+    /// Pointer target as hex string for JSON serialization.
+    /// </summary>
+    [JsonPropertyName("pointerTarget")]
+    public string? PointerTargetHex => PointerTarget.HasValue && PointerTarget.Value != 0 ? $"0x{PointerTarget.Value:X}" : null;
 
     /// <summary>
     /// Name of the matching FFXIVClientStructs field, if any.

@@ -203,10 +203,11 @@ public class MemoryExplorerWindow : Window, IDisposable
             currentLayout = MemoryAnalyzer.Analyze(address, size, fullName);
 
             // Compare with declared fields
+            var declaredFieldCount = currentValidation.FieldValidations?.Count ?? 0;
             LayoutComparator.UpdateWithDeclaredFields(currentLayout, currentValidation);
             currentComparison = LayoutComparator.Compare(currentLayout, currentValidation);
 
-            statusMessage = $"Analyzed {currentLayout.Fields.Count} fields, {currentLayout.Summary.MatchedFields} matched, {currentLayout.Summary.UndocumentedFields} undocumented";
+            statusMessage = $"Analyzed {currentLayout.Fields.Count} fields, {currentLayout.Summary.MatchedFields} matched, {currentLayout.Summary.UndocumentedFields} undocumented (FFXIVClientStructs has {declaredFieldCount} declared fields)";
             selectedField = null;
         }
         catch (Exception ex)

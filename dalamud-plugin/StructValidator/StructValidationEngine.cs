@@ -200,7 +200,8 @@ public unsafe class StructValidationEngine
     /// </summary>
     private void ValidateStructFields(nint basePtr, Type structType, StructValidationResult result)
     {
-        var fields = structType.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        // Get all fields including inherited ones by walking the type hierarchy
+        var fields = GetAllFields(structType);
 
         foreach (var field in fields)
         {
@@ -463,6 +464,23 @@ public unsafe class StructValidationEngine
         }
         catch { }
         return "Unknown";
+    }
+
+    /// <summary>
+    /// Get all fields including inherited ones by walking the type hierarchy.
+    /// </summary>
+    private IEnumerable<FieldInfo> GetAllFields(Type type)
+    {
+        var fields = new List<FieldInfo>();
+        var currentType = type;
+
+        while (currentType != null && currentType != typeof(object) && currentType != typeof(ValueType))
+        {
+            fields.AddRange(currentType.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly));
+            currentType = currentType.BaseType;
+        }
+
+        return fields;
     }
 
     /// <summary>
