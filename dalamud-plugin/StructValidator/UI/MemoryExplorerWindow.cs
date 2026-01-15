@@ -8,8 +8,13 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Plugin.Services;
 using StructValidator.Discovery;
 using StructValidator.Memory;
+using StructValidator.Models;
+using StructValidator.Services;
+using StructValidator.Services.Persistence;
+using StructValidator.UI.Components;
 
 namespace StructValidator.UI;
 
@@ -21,6 +26,10 @@ public class MemoryExplorerWindow : Window, IDisposable
 {
     private readonly StructValidationEngine validationEngine;
     private readonly Configuration configuration;
+    private readonly SessionStore? sessionStore;
+    private readonly SessionPanel? sessionPanel;
+    private readonly VTableAnalyzerService vtableAnalyzer;
+    private readonly IPluginLog log;
 
     // Singleton selection
     private List<string> singletonNames = new();
@@ -44,6 +53,8 @@ public class MemoryExplorerWindow : Window, IDisposable
     private DiscoveredLayout? currentLayout;
     private StructValidationResult? currentValidation;
     private LayoutComparisonResult? currentComparison;
+    private List<Memory.ArrayPattern>? currentArrayPatterns;
+    private EnhancedVTableAnalysis? currentVTableAnalysis;
 
     private string statusMessage = "";
 
@@ -53,11 +64,23 @@ public class MemoryExplorerWindow : Window, IDisposable
     private bool showPadding = false;
     private float minConfidence = 0.0f;
 
-    public MemoryExplorerWindow(StructValidationEngine validationEngine, Configuration configuration)
+    public MemoryExplorerWindow(
+        StructValidationEngine validationEngine,
+        Configuration configuration,
+        SessionStore? sessionStore,
+        IPluginLog log)
         : base("Memory Explorer##MemoryExplorer", ImGuiWindowFlags.None)
     {
         this.validationEngine = validationEngine;
         this.configuration = configuration;
+        this.sessionStore = sessionStore;
+        this.log = log;
+        this.vtableAnalyzer = new VTableAnalyzerService(log);
+
+        if (sessionStore != null)
+        {
+            this.sessionPanel = new SessionPanel(sessionStore, msg => statusMessage = msg);
+        }
 
         SizeConstraints = new WindowSizeConstraints
         {
@@ -596,6 +619,50 @@ public class MemoryExplorerWindow : Window, IDisposable
 
         ImGui.Separator();
 
+        // Tab bar
+        if (ImGui.BeginTabBar("ExplorerTabs"))
+        {
+            // Fields tab
+            if (ImGui.BeginTabItem("Fields"))
+            {
+                DrawFieldsTab();
+                ImGui.EndTabItem();
+            }
+
+            // Comparison tab
+            if (ImGui.BeginTabItem("Comparison"))
+            {
+                DrawComparisonTab();
+                ImGui.EndTabItem();
+            }
+
+            // Arrays tab
+            if (ImGui.BeginTabItem("Arrays"))
+            {
+                DrawArraysTab();
+                ImGui.EndTabItem();
+            }
+
+            // VTable tab
+            if (ImGui.BeginTabItem("VTable"))
+            {
+                DrawVTableTab();
+                ImGui.EndTabItem();
+            }
+
+            // Sessions tab (only if session storage is available)
+            if (sessionPanel != null && ImGui.BeginTabItem("Sessions"))
+            {
+                DrawSessionsTab();
+                ImGui.EndTabItem();
+            }
+
+            ImGui.EndTabBar();
+        }
+    }
+
+    private void DrawFieldsTab()
+    {
         // Filters
         ImGui.Checkbox("Show Only Undocumented", ref showOnlyUndocumented);
         ImGui.SameLine();
@@ -626,6 +693,261 @@ public class MemoryExplorerWindow : Window, IDisposable
             DrawFieldDetails();
         }
         ImGui.EndChild();
+    }
+
+    private void DrawComparisonTab()
+    {
+        ComparisonPanel.Draw(currentComparison, currentLayout);
+    }
+
+    private void DrawArraysTab()
+    {
+        // Detect Arrays button
+        if (ImGui.Button("Detect Arrays"))
+        {
+            DetectArrayPatterns();
+        }
+
+        if (currentArrayPatterns != null && currentArrayPatterns.Count > 0)
+        {
+            ImGui.SameLine();
+            ImGui.Text($"({currentArrayPatterns.Count} patterns found)");
+        }
+
+        ImGui.Separator();
+
+        ArrayPatternPanel.Draw(currentArrayPatterns, OnCopyArrayPattern);
+    }
+
+    private void DetectArrayPatterns()
+    {
+        if (currentLayout == null || currentNavigation == null) return;
+
+        statusMessage = "Detecting array patterns...";
+
+        try
+        {
+            var result = PatternRecognizer.DetectPatterns(
+                currentNavigation.Address,
+                currentNavigation.Size);
+            currentArrayPatterns = result.ArrayPatterns;
+
+            statusMessage = $"Detected {currentArrayPatterns.Count} potential array patterns";
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Array detection failed: {ex.Message}";
+        }
+    }
+
+    private void OnCopyArrayPattern(Memory.ArrayPattern pattern)
+    {
+        var suggestedType = $"FixedArray<byte, {pattern.Stride}>";
+        var yaml = $"      - type: {suggestedType}\n" +
+                   $"        name: Array_0x{pattern.StartOffset:X}\n" +
+                   $"        offset: 0x{pattern.StartOffset:X}\n" +
+                   $"        size: {pattern.Count}";
+
+        ImGui.SetClipboardText(yaml);
+        statusMessage = $"Copied YAML for array at 0x{pattern.StartOffset:X} to clipboard";
+    }
+
+    private void DrawVTableTab()
+    {
+        // Analyze VTable button
+        if (ImGui.Button("Analyze VTable"))
+        {
+            AnalyzeVTable();
+        }
+
+        if (currentVTableAnalysis != null && currentVTableAnalysis.IsValid)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.5f, 1f, 0.5f, 1f),
+                $"({currentVTableAnalysis.Slots.Count} slots, {currentVTableAnalysis.MatchedSlotCount} declared)");
+        }
+
+        ImGui.Separator();
+
+        VTablePanel.Draw(
+            currentVTableAnalysis,
+            OnExportVTableIDA,
+            OnExportVTableGhidra,
+            OnCopyVTableAddresses);
+    }
+
+    private void AnalyzeVTable()
+    {
+        if (currentLayout == null || currentNavigation == null)
+        {
+            statusMessage = "No struct analyzed. Analyze a struct first.";
+            return;
+        }
+
+        statusMessage = "Analyzing VTable...";
+
+        try
+        {
+            // Get the struct type if available
+            Type? structType = null;
+            if (!string.IsNullOrEmpty(currentNavigation.TypeName))
+            {
+                structType = TypeResolver.FindType(currentNavigation.TypeName);
+            }
+
+            // Run VTable analysis
+            currentVTableAnalysis = vtableAnalyzer.Analyze(currentNavigation.Address, structType);
+
+            if (currentVTableAnalysis.IsValid)
+            {
+                statusMessage = $"VTable analysis complete: {currentVTableAnalysis.Slots.Count} slots, " +
+                               $"{currentVTableAnalysis.MatchedSlotCount} declared, " +
+                               $"{currentVTableAnalysis.UndeclaredSlotCount} undeclared";
+            }
+            else
+            {
+                statusMessage = "No valid VTable found at this address";
+            }
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"VTable analysis failed: {ex.Message}";
+            log.Error($"VTable analysis error: {ex}");
+        }
+    }
+
+    private void OnExportVTableIDA(EnhancedVTableAnalysis analysis)
+    {
+        try
+        {
+            var script = vtableAnalyzer.ExportToIDA(analysis);
+            var structName = analysis.StructName?.Split('.').LastOrDefault() ?? "VTable";
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                $"vtable-{structName}-{DateTime.Now:yyyyMMdd-HHmmss}.py");
+
+            File.WriteAllText(path, script);
+            statusMessage = $"Exported IDA script to {path}";
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"IDA export failed: {ex.Message}";
+        }
+    }
+
+    private void OnExportVTableGhidra(EnhancedVTableAnalysis analysis)
+    {
+        try
+        {
+            var script = vtableAnalyzer.ExportToGhidra(analysis);
+            var structName = analysis.StructName?.Split('.').LastOrDefault() ?? "VTable";
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                $"vtable-{structName}-{DateTime.Now:yyyyMMdd-HHmmss}-ghidra.py");
+
+            File.WriteAllText(path, script);
+            statusMessage = $"Exported Ghidra script to {path}";
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Ghidra export failed: {ex.Message}";
+        }
+    }
+
+    private void OnCopyVTableAddresses(EnhancedVTableAnalysis analysis)
+    {
+        try
+        {
+            var text = vtableAnalyzer.ExportAddressList(analysis);
+            ImGui.SetClipboardText(text);
+            statusMessage = "Copied VTable addresses to clipboard";
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Copy failed: {ex.Message}";
+        }
+    }
+
+    private void DrawSessionsTab()
+    {
+        if (sessionPanel == null) return;
+
+        var currentAnalysisResult = BuildCurrentAnalysisResult();
+        sessionPanel.Draw(currentAnalysisResult, OnSessionLoaded);
+    }
+
+    private AnalysisResult? BuildCurrentAnalysisResult()
+    {
+        if (currentLayout == null || currentNavigation == null)
+            return null;
+
+        // Convert array patterns to the models format
+        List<Models.ArrayPattern>? detectedArrays = null;
+        if (currentArrayPatterns != null)
+        {
+            detectedArrays = currentArrayPatterns.Select(p => new Models.ArrayPattern
+            {
+                Offset = p.StartOffset,
+                Stride = p.Stride,
+                Count = p.Count,
+                Confidence = p.Confidence
+            }).ToList();
+        }
+
+        return new AnalysisResult
+        {
+            StructName = currentLayout.StructName,
+            Address = currentNavigation.Address,
+            AddressHex = $"0x{currentNavigation.Address:X}",
+            Timestamp = DateTime.UtcNow,
+            GameVersion = validationEngine.GameVersion,
+            Discovery = currentLayout,
+            Comparison = currentComparison,
+            DetectedArrays = detectedArrays
+        };
+    }
+
+    private void OnSessionLoaded(SavedSession session)
+    {
+        if (session.Result == null)
+        {
+            statusMessage = "Session has no analysis result";
+            return;
+        }
+
+        // Restore the analysis state from the session
+        currentLayout = session.Result.Discovery;
+        currentComparison = session.Result.Comparison;
+
+        // Convert detected arrays back to memory format
+        if (session.Result.DetectedArrays != null)
+        {
+            currentArrayPatterns = session.Result.DetectedArrays.Select(a => new Memory.ArrayPattern
+            {
+                StartOffset = a.Offset,
+                Stride = a.Stride,
+                Count = a.Count,
+                Confidence = a.Confidence
+            }).ToList();
+        }
+        else
+        {
+            currentArrayPatterns = null;
+        }
+
+        // Update navigation state (limited since we may not have the original address accessible)
+        if (currentLayout != null)
+        {
+            currentNavigation = new NavigationEntry
+            {
+                Address = session.Result.Address,
+                Size = currentLayout.AnalyzedSize,
+                TypeName = currentLayout.StructName,
+                DisplayName = $"Session: {session.Name}"
+            };
+        }
+
+        statusMessage = $"Loaded session: {session.Name}";
     }
 
     private void DrawSummary()

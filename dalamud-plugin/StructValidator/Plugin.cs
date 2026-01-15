@@ -8,6 +8,8 @@ using Dalamud.Plugin.Services;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
 using StructValidator.Memory;
+using StructValidator.Services;
+using StructValidator.Services.Persistence;
 using StructValidator.UI;
 
 namespace StructValidator;
@@ -24,6 +26,9 @@ public sealed class Plugin : IDalamudPlugin
     private const string CommandExport = "/structvalexport";
     private const string CommandExplore = "/structexplore";
     private const string CommandRefresh = "/structvalrefresh";
+    private const string CommandBatch = "/structbatch";
+    private const string CommandSig = "/structsig";
+    private const string CommandVersion = "/structversion";
 
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commandManager;
@@ -33,8 +38,16 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem windowSystem = new("StructValidator");
     private readonly MainWindow mainWindow;
     private readonly MemoryExplorerWindow memoryExplorerWindow;
+    private readonly BatchAnalysisWindow batchAnalysisWindow;
+    private readonly SignatureWindow signatureWindow;
     private readonly StructValidationEngine validationEngine;
     private readonly Configuration configuration;
+    private readonly SessionStore sessionStore;
+    private readonly BatchAnalyzer batchAnalyzer;
+    private readonly ExportService exportService;
+    private readonly SignatureGenerator signatureGenerator;
+    private readonly VersionTracker versionTracker;
+    private readonly VersionHistoryWindow versionHistoryWindow;
 
     public Plugin(
         IDalamudPluginInterface pluginInterface,
@@ -56,11 +69,30 @@ public sealed class Plugin : IDalamudPlugin
         var vtableCount = TypeResolver.BuildVTableCache();
         pluginLog.Info($"Built VTable cache with {vtableCount} type mappings");
 
+        // Create persistence and service layer
+        var configPath = Path.GetDirectoryName(pluginInterface.GetPluginConfigDirectory()) ?? pluginInterface.GetPluginConfigDirectory();
+        this.sessionStore = new SessionStore(configPath, pluginLog);
+        this.batchAnalyzer = new BatchAnalyzer(validationEngine, pluginLog);
+        this.exportService = new ExportService(pluginLog);
+        this.signatureGenerator = new SignatureGenerator(pluginLog);
+        this.versionTracker = new VersionTracker(
+            new VersionStore(configPath, pluginLog),
+            validationEngine,
+            pluginLog);
+        this.versionTracker.Initialize();
+
+        // Create windows
         this.mainWindow = new MainWindow(this, validationEngine, configuration);
-        this.memoryExplorerWindow = new MemoryExplorerWindow(validationEngine, configuration);
+        this.memoryExplorerWindow = new MemoryExplorerWindow(validationEngine, configuration, sessionStore, pluginLog);
+        this.batchAnalysisWindow = new BatchAnalysisWindow(batchAnalyzer, exportService, pluginLog, configPath);
+        this.signatureWindow = new SignatureWindow(signatureGenerator, validationEngine, pluginLog);
+        this.versionHistoryWindow = new VersionHistoryWindow(versionTracker, pluginLog);
 
         windowSystem.AddWindow(mainWindow);
         windowSystem.AddWindow(memoryExplorerWindow);
+        windowSystem.AddWindow(batchAnalysisWindow);
+        windowSystem.AddWindow(signatureWindow);
+        windowSystem.AddWindow(versionHistoryWindow);
 
         commandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
@@ -87,6 +119,21 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Rebuild the VTable type cache"
         });
 
+        commandManager.AddHandler(CommandBatch, new CommandInfo(OnBatchCommand)
+        {
+            HelpMessage = "Open the Batch Analysis window"
+        });
+
+        commandManager.AddHandler(CommandSig, new CommandInfo(OnSigCommand)
+        {
+            HelpMessage = "Open the Signature Generator window"
+        });
+
+        commandManager.AddHandler(CommandVersion, new CommandInfo(OnVersionCommand)
+        {
+            HelpMessage = "Open the Version History window"
+        });
+
         pluginInterface.UiBuilder.Draw += DrawUI;
         pluginInterface.UiBuilder.OpenConfigUi += OnOpenConfigUi;
     }
@@ -96,12 +143,18 @@ public sealed class Plugin : IDalamudPlugin
         windowSystem.RemoveAllWindows();
         mainWindow.Dispose();
         memoryExplorerWindow.Dispose();
+        batchAnalysisWindow.Dispose();
+        signatureWindow.Dispose();
+        versionHistoryWindow.Dispose();
 
         commandManager.RemoveHandler(CommandName);
         commandManager.RemoveHandler(CommandRunAll);
         commandManager.RemoveHandler(CommandExport);
         commandManager.RemoveHandler(CommandExplore);
         commandManager.RemoveHandler(CommandRefresh);
+        commandManager.RemoveHandler(CommandBatch);
+        commandManager.RemoveHandler(CommandSig);
+        commandManager.RemoveHandler(CommandVersion);
     }
 
     private void OnCommand(string command, string args)
@@ -120,6 +173,21 @@ public sealed class Plugin : IDalamudPlugin
         TypeResolver.ClearVTableCache();
         var count = TypeResolver.BuildVTableCache();
         chatGui.Print($"[StructValidator] VTable cache rebuilt with {count} type mappings");
+    }
+
+    private void OnBatchCommand(string command, string args)
+    {
+        batchAnalysisWindow.IsOpen = true;
+    }
+
+    private void OnSigCommand(string command, string args)
+    {
+        signatureWindow.IsOpen = true;
+    }
+
+    private void OnVersionCommand(string command, string args)
+    {
+        versionHistoryWindow.IsOpen = true;
     }
 
     private void OnRunAllCommand(string command, string args)

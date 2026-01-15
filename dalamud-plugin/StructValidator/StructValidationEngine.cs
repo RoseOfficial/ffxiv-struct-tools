@@ -21,6 +21,11 @@ public unsafe class StructValidationEngine
     private const int MaxRecursionDepth = 3;
     private const int MaxNestedStructSize = 1024; // 1KB limit for nested structs
 
+    /// <summary>
+    /// Get the current FFXIVClientStructs version.
+    /// </summary>
+    public string GameVersion => GetGameVersion();
+
     public StructValidationEngine(IPluginLog pluginLog)
     {
         this.pluginLog = pluginLog;
@@ -582,5 +587,128 @@ public unsafe class StructValidationEngine
     public IEnumerable<string> GetSingletonNames()
     {
         return GetSingletonTypes().Select(t => t.FullName ?? t.Name);
+    }
+
+    /// <summary>
+    /// Get singleton instance address, size, and type by name.
+    /// </summary>
+    /// <param name="fullName">Full type name of the singleton.</param>
+    /// <returns>Tuple of (address, size, type). Address is 0 if unavailable.</returns>
+    public (nint Address, int Size, Type? Type) GetSingletonInfo(string fullName)
+    {
+        var type = GetSingletonTypes().FirstOrDefault(t => (t.FullName ?? t.Name) == fullName);
+        if (type == null)
+        {
+            return (nint.Zero, 0, null);
+        }
+
+        try
+        {
+            var instanceMethod = type.GetMethod("Instance", BindingFlags.Static | BindingFlags.Public);
+            if (instanceMethod == null)
+            {
+                return (nint.Zero, 0, type);
+            }
+
+            nint ptr = 0;
+            Type structType = type;
+
+            var returnType = instanceMethod.ReturnType;
+
+            if (returnType.IsPointer)
+            {
+                structType = returnType.GetElementType() ?? type;
+
+                var delegateType = typeof(Func<nint>);
+                var del = Delegate.CreateDelegate(delegateType, instanceMethod, false);
+
+                if (del != null)
+                {
+                    ptr = ((Func<nint>)del)();
+                }
+                else
+                {
+                    var funcPtr = instanceMethod.MethodHandle.GetFunctionPointer();
+                    var func = (delegate* unmanaged<nint>)funcPtr;
+                    ptr = func();
+                }
+            }
+            else
+            {
+                var instanceResult = instanceMethod.Invoke(null, null);
+                ptr = GetPointerValue(instanceResult);
+                structType = returnType;
+            }
+
+            if (ptr == 0)
+            {
+                return (nint.Zero, 0, structType);
+            }
+
+            // Get struct size
+            var sizeAttr = structType.GetCustomAttribute<StructLayoutAttribute>();
+            int size = sizeAttr?.Size ?? 0x400; // Default size if not specified
+
+            // If StructLayout doesn't have size, try to compute it from fields
+            if (size == 0)
+            {
+                size = ComputeStructSize(structType);
+            }
+
+            return (ptr, size, structType);
+        }
+        catch (Exception ex)
+        {
+            pluginLog.Debug($"Failed to get singleton info for {fullName}: {ex.Message}");
+            return (nint.Zero, 0, type);
+        }
+    }
+
+    /// <summary>
+    /// Compute approximate struct size from field offsets.
+    /// </summary>
+    private int ComputeStructSize(Type type)
+    {
+        var maxOffset = 0;
+        var maxFieldSize = 0;
+
+        foreach (var field in GetAllFields(type))
+        {
+            var offsetAttr = field.GetCustomAttribute<FieldOffsetAttribute>();
+            if (offsetAttr != null)
+            {
+                var fieldSize = GetFieldSize(field.FieldType);
+                if (offsetAttr.Value + fieldSize > maxOffset + maxFieldSize)
+                {
+                    maxOffset = offsetAttr.Value;
+                    maxFieldSize = fieldSize;
+                }
+            }
+        }
+
+        return maxOffset + maxFieldSize > 0 ? maxOffset + maxFieldSize : 0x400;
+    }
+
+    private int GetFieldSize(Type fieldType)
+    {
+        if (fieldType.IsPointer || fieldType == typeof(nint) || fieldType == typeof(nuint))
+            return 8;
+        if (fieldType == typeof(byte) || fieldType == typeof(sbyte) || fieldType == typeof(bool))
+            return 1;
+        if (fieldType == typeof(short) || fieldType == typeof(ushort))
+            return 2;
+        if (fieldType == typeof(int) || fieldType == typeof(uint) || fieldType == typeof(float))
+            return 4;
+        if (fieldType == typeof(long) || fieldType == typeof(ulong) || fieldType == typeof(double))
+            return 8;
+        if (fieldType.IsEnum)
+            return GetFieldSize(Enum.GetUnderlyingType(fieldType));
+
+        // For nested structs, try to get size from StructLayout
+        var sizeAttr = fieldType.GetCustomAttribute<StructLayoutAttribute>();
+        if (sizeAttr?.Size > 0)
+            return sizeAttr.Size;
+
+        return 8; // Default assumption
     }
 }
