@@ -7,6 +7,7 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
+using StructValidator.UI;
 
 namespace StructValidator;
 
@@ -20,6 +21,7 @@ public sealed class Plugin : IDalamudPlugin
     private const string CommandName = "/structval";
     private const string CommandRunAll = "/structvalall";
     private const string CommandExport = "/structvalexport";
+    private const string CommandExplore = "/structexplore";
 
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ICommandManager commandManager;
@@ -28,6 +30,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private readonly WindowSystem windowSystem = new("StructValidator");
     private readonly MainWindow mainWindow;
+    private readonly MemoryExplorerWindow memoryExplorerWindow;
     private readonly StructValidationEngine validationEngine;
     private readonly Configuration configuration;
 
@@ -47,8 +50,10 @@ public sealed class Plugin : IDalamudPlugin
 
         this.validationEngine = new StructValidationEngine(pluginLog);
         this.mainWindow = new MainWindow(this, validationEngine, configuration);
+        this.memoryExplorerWindow = new MemoryExplorerWindow(validationEngine, configuration);
 
         windowSystem.AddWindow(mainWindow);
+        windowSystem.AddWindow(memoryExplorerWindow);
 
         commandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
@@ -65,6 +70,11 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Export validation results to JSON file"
         });
 
+        commandManager.AddHandler(CommandExplore, new CommandInfo(OnExploreCommand)
+        {
+            HelpMessage = "Open the Memory Explorer to discover struct layouts"
+        });
+
         pluginInterface.UiBuilder.Draw += DrawUI;
         pluginInterface.UiBuilder.OpenConfigUi += OnOpenConfigUi;
     }
@@ -73,15 +83,22 @@ public sealed class Plugin : IDalamudPlugin
     {
         windowSystem.RemoveAllWindows();
         mainWindow.Dispose();
+        memoryExplorerWindow.Dispose();
 
         commandManager.RemoveHandler(CommandName);
         commandManager.RemoveHandler(CommandRunAll);
         commandManager.RemoveHandler(CommandExport);
+        commandManager.RemoveHandler(CommandExplore);
     }
 
     private void OnCommand(string command, string args)
     {
         mainWindow.IsOpen = true;
+    }
+
+    private void OnExploreCommand(string command, string args)
+    {
+        memoryExplorerWindow.IsOpen = true;
     }
 
     private void OnRunAllCommand(string command, string args)

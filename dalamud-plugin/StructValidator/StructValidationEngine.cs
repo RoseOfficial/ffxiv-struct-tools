@@ -464,4 +464,12 @@ public unsafe class StructValidationEngine
         catch { }
         return "Unknown";
     }
+
+    /// <summary>
+    /// Get all singleton type names for the memory explorer.
+    /// </summary>
+    public IEnumerable<string> GetSingletonNames()
+    {
+        return GetSingletonTypes().Select(t => t.FullName ?? t.Name);
+    }
 }
