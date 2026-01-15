@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using StructValidator.Memory;
 
 namespace StructValidator.Discovery;
@@ -207,6 +209,50 @@ public static class LayoutComparator
 
                 // Re-read the value using the declared type for accurate display
                 var declaredValue = ReadValueAsType(layout.BaseAddress + field.Offset, declaredField.Type);
+                if (declaredValue != null)
+                {
+                    field.Value = declaredValue;
+                }
+            }
+        }
+
+        // Update summary
+        layout.Summary.MatchedFields = layout.Fields.Count(f => f.HasMatch);
+        layout.Summary.UndocumentedFields = layout.Fields.Count(f => !f.HasMatch && f.InferredType != InferredTypeKind.Padding);
+    }
+
+    /// <summary>
+    /// Update a discovered layout with matches from a Type directly.
+    /// Used when navigating to pointer targets where we know the type.
+    /// </summary>
+    public static void UpdateWithDeclaredFieldsFromType(DiscoveredLayout layout, Type type)
+    {
+        // Get declared size
+        var layoutAttr = type.GetCustomAttribute<StructLayoutAttribute>();
+        if (layoutAttr?.Size > 0)
+        {
+            layout.DeclaredSize = layoutAttr.Size;
+        }
+
+        // Get all fields with offsets
+        var declaredFields = TypeResolver.GetDeclaredFields(type);
+        var declaredByOffset = new Dictionary<int, (string Name, int Offset, Type FieldType, int? Size)>();
+
+        foreach (var field in declaredFields)
+        {
+            if (!declaredByOffset.ContainsKey(field.Offset))
+                declaredByOffset[field.Offset] = field;
+        }
+
+        foreach (var field in layout.Fields)
+        {
+            if (declaredByOffset.TryGetValue(field.Offset, out var declaredField))
+            {
+                field.DeclaredName = declaredField.Name;
+                field.DeclaredType = TypeResolver.GetDisplayTypeName(declaredField.FieldType);
+
+                // Re-read the value using the declared type for accurate display
+                var declaredValue = ReadValueAsType(layout.BaseAddress + field.Offset, field.DeclaredType);
                 if (declaredValue != null)
                 {
                     field.Value = declaredValue;

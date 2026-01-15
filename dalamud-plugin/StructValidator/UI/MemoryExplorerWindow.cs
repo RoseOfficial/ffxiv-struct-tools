@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
 using StructValidator.Discovery;
@@ -13,22 +15,39 @@ namespace StructValidator.UI;
 
 /// <summary>
 /// Memory Explorer window for discovering struct layouts.
+/// Supports navigation through pointer chains to explore non-singleton structs.
 /// </summary>
 public class MemoryExplorerWindow : Window, IDisposable
 {
     private readonly StructValidationEngine validationEngine;
     private readonly Configuration configuration;
 
+    // Singleton selection
     private List<string> singletonNames = new();
     private int selectedSingletonIndex = -1;
     private string selectedSingletonName = "";
 
+    // Navigation state
+    private Stack<NavigationEntry> navigationHistory = new();
+    private NavigationEntry? currentNavigation;
+
+    // Manual address entry
+    private string addressInput = "";
+    private string sizeInput = "0x400";
+
+    // Type selection for manual navigation
+    private List<Type> allStructTypes = new();
+    private int selectedTypeIndex = -1;
+    private string typeSearchFilter = "";
+
+    // Current analysis results
     private DiscoveredLayout? currentLayout;
     private StructValidationResult? currentValidation;
     private LayoutComparisonResult? currentComparison;
 
     private string statusMessage = "";
 
+    // Field list state
     private DiscoveredField? selectedField;
     private bool showOnlyUndocumented = false;
     private bool showPadding = false;
@@ -42,7 +61,7 @@ public class MemoryExplorerWindow : Window, IDisposable
 
         SizeConstraints = new WindowSizeConstraints
         {
-            MinimumSize = new Vector2(800, 600),
+            MinimumSize = new Vector2(900, 650),
             MaximumSize = new Vector2(float.MaxValue, float.MaxValue)
         };
     }
@@ -58,12 +77,25 @@ public class MemoryExplorerWindow : Window, IDisposable
         singletonNames.Sort();
     }
 
+    /// <summary>
+    /// Refresh the list of all struct types for type selection.
+    /// </summary>
+    private void RefreshStructTypes()
+    {
+        TypeResolver.Initialize();
+        allStructTypes = TypeResolver.GetAllStructTypes().ToList();
+    }
+
     public override void OnOpen()
     {
         base.OnOpen();
         if (singletonNames.Count == 0)
         {
             RefreshSingletonList();
+        }
+        if (allStructTypes.Count == 0)
+        {
+            RefreshStructTypes();
         }
     }
 
@@ -72,10 +104,16 @@ public class MemoryExplorerWindow : Window, IDisposable
         DrawToolbar();
         ImGui.Separator();
 
+        // Navigation breadcrumbs
+        if (navigationHistory.Count > 0 || currentNavigation != null)
+        {
+            DrawNavigationBreadcrumbs();
+            ImGui.Separator();
+        }
+
         if (currentLayout == null)
         {
-            ImGui.TextWrapped("Select a singleton from the dropdown and click 'Analyze' to discover its memory layout.");
-            ImGui.TextWrapped("The explorer will scan memory and infer field types, then compare with FFXIVClientStructs definitions.");
+            DrawWelcomeMessage();
         }
         else
         {
@@ -90,12 +128,24 @@ public class MemoryExplorerWindow : Window, IDisposable
         }
     }
 
+    private void DrawWelcomeMessage()
+    {
+        ImGui.TextWrapped("Memory Explorer - Explore struct layouts in game memory");
+        ImGui.Spacing();
+        ImGui.TextWrapped("Options:");
+        ImGui.BulletText("Select a singleton from the dropdown and click 'Analyze'");
+        ImGui.BulletText("Enter a memory address directly and click 'Go'");
+        ImGui.BulletText("Click 'Explore' on pointer fields to navigate to their targets");
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(0.7f, 0.7f, 0.7f, 1.0f), "The explorer will scan memory and infer field types, then compare with FFXIVClientStructs definitions.");
+    }
+
     private void DrawToolbar()
     {
-        // Singleton selector
+        // Row 1: Singleton selector
         ImGui.Text("Singleton:");
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(300);
+        ImGui.SetNextItemWidth(250);
 
         if (ImGui.BeginCombo("##SingletonCombo", selectedSingletonName))
         {
@@ -133,10 +183,11 @@ public class MemoryExplorerWindow : Window, IDisposable
 
         ImGui.SameLine();
 
-        if (ImGui.Button("Refresh List"))
+        if (ImGui.Button("Refresh"))
         {
             RefreshSingletonList();
-            statusMessage = $"Found {singletonNames.Count} singletons";
+            RefreshStructTypes();
+            statusMessage = $"Found {singletonNames.Count} singletons, {allStructTypes.Count} struct types";
         }
 
         ImGui.SameLine();
@@ -157,6 +208,164 @@ public class MemoryExplorerWindow : Window, IDisposable
                 ExportToYaml();
             }
         }
+
+        // Row 2: Manual address entry
+        ImGui.Text("Address: ");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(150);
+        ImGui.InputText("##AddressInput", ref addressInput, 32);
+
+        ImGui.SameLine();
+        ImGui.Text("Size:");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(80);
+        ImGui.InputText("##SizeInput", ref sizeInput, 16);
+
+        ImGui.SameLine();
+        ImGui.Text("Type:");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(200);
+        DrawTypeSelector();
+
+        ImGui.SameLine();
+
+        if (ImGui.Button("Go"))
+        {
+            NavigateToAddress();
+        }
+    }
+
+    private void DrawTypeSelector()
+    {
+        var displayName = selectedTypeIndex >= 0 && selectedTypeIndex < allStructTypes.Count
+            ? allStructTypes[selectedTypeIndex].Name
+            : "(auto-detect)";
+
+        if (ImGui.BeginCombo("##TypeCombo", displayName))
+        {
+            // Search filter
+            ImGui.SetNextItemWidth(-1);
+            ImGui.InputTextWithHint("##TypeSearch", "Search types...", ref typeSearchFilter, 64);
+
+            // Auto option
+            if (ImGui.Selectable("(auto-detect)", selectedTypeIndex == -1))
+            {
+                selectedTypeIndex = -1;
+            }
+
+            ImGui.Separator();
+
+            // Filtered type list
+            var filter = typeSearchFilter.ToLowerInvariant();
+            for (int i = 0; i < allStructTypes.Count; i++)
+            {
+                var type = allStructTypes[i];
+                var name = type.Name;
+
+                if (!string.IsNullOrEmpty(filter) && !name.ToLowerInvariant().Contains(filter))
+                    continue;
+
+                bool isSelected = i == selectedTypeIndex;
+                if (ImGui.Selectable(name, isSelected))
+                {
+                    selectedTypeIndex = i;
+                }
+
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.BeginTooltip();
+                    ImGui.Text(type.FullName ?? name);
+                    var size = TypeResolver.GetDeclaredSize(type);
+                    if (size.HasValue)
+                        ImGui.Text($"Size: 0x{size.Value:X}");
+                    ImGui.EndTooltip();
+                }
+
+                if (isSelected)
+                    ImGui.SetItemDefaultFocus();
+            }
+            ImGui.EndCombo();
+        }
+    }
+
+    private void DrawNavigationBreadcrumbs()
+    {
+        // Back button
+        var canGoBack = navigationHistory.Count > 0;
+        if (!canGoBack)
+            ImGui.BeginDisabled();
+
+        if (ImGui.Button("<- Back"))
+        {
+            NavigateBack();
+        }
+
+        if (!canGoBack)
+            ImGui.EndDisabled();
+
+        ImGui.SameLine();
+        ImGui.Text("Path:");
+        ImGui.SameLine();
+
+        // Build breadcrumb trail
+        var entries = navigationHistory.Reverse().ToList();
+        if (currentNavigation != null)
+            entries.Add(currentNavigation);
+
+        for (int i = 0; i < entries.Count; i++)
+        {
+            var entry = entries[i];
+            var isLast = i == entries.Count - 1;
+
+            if (i > 0)
+            {
+                ImGui.SameLine();
+                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1.0f), "->");
+                ImGui.SameLine();
+            }
+
+            if (isLast)
+            {
+                ImGui.TextColored(new Vector4(0.8f, 0.8f, 1.0f, 1.0f), entry.DisplayName);
+            }
+            else
+            {
+                // Make earlier entries clickable
+                if (ImGui.SmallButton($"{entry.DisplayName}##{i}"))
+                {
+                    // Navigate back to this entry
+                    NavigateToHistoryIndex(i);
+                }
+            }
+
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.BeginTooltip();
+                ImGui.Text($"Address: 0x{entry.Address:X}");
+                ImGui.Text($"Size: 0x{entry.Size:X}");
+                if (!string.IsNullOrEmpty(entry.TypeName))
+                    ImGui.Text($"Type: {entry.TypeName}");
+                ImGui.EndTooltip();
+            }
+        }
+    }
+
+    private void NavigateToHistoryIndex(int index)
+    {
+        var entries = navigationHistory.Reverse().ToList();
+        if (index < 0 || index >= entries.Count)
+            return;
+
+        // Clear history past this point
+        var newHistory = new Stack<NavigationEntry>();
+        for (int i = 0; i < index; i++)
+        {
+            newHistory.Push(entries[i]);
+        }
+
+        navigationHistory = new Stack<NavigationEntry>(newHistory.Reverse());
+        currentNavigation = entries[index];
+        AnalyzeCurrentNavigation();
     }
 
     private void AnalyzeSelectedSingleton()
@@ -187,33 +396,195 @@ public class MemoryExplorerWindow : Window, IDisposable
             }
 
             // Parse address from "Instance at 0x..."
-            var addrMatch = System.Text.RegularExpressions.Regex.Match(instanceIssue.Message, @"0x([0-9A-Fa-f]+)");
+            var addrMatch = Regex.Match(instanceIssue.Message, @"0x([0-9A-Fa-f]+)");
             if (!addrMatch.Success)
             {
                 statusMessage = "Failed to parse instance address";
                 return;
             }
 
-            nint address = nint.Parse(addrMatch.Groups[1].Value, System.Globalization.NumberStyles.HexNumber);
+            nint address = nint.Parse(addrMatch.Groups[1].Value, NumberStyles.HexNumber);
 
             // Determine size to analyze
             int size = currentValidation.DeclaredSize ?? currentValidation.ActualSize ?? 0x400;
 
+            // Clear navigation history and start fresh
+            navigationHistory.Clear();
+            currentNavigation = NavigationEntry.FromSingleton(address, size, fullName);
+
             // Run memory analysis
-            currentLayout = MemoryAnalyzer.Analyze(address, size, fullName);
-
-            // Compare with declared fields
-            var declaredFieldCount = currentValidation.FieldValidations?.Count ?? 0;
-            LayoutComparator.UpdateWithDeclaredFields(currentLayout, currentValidation);
-            currentComparison = LayoutComparator.Compare(currentLayout, currentValidation);
-
-            statusMessage = $"Analyzed {currentLayout.Fields.Count} fields, {currentLayout.Summary.MatchedFields} matched, {currentLayout.Summary.UndocumentedFields} undocumented (FFXIVClientStructs has {declaredFieldCount} declared fields)";
-            selectedField = null;
+            AnalyzeCurrentNavigation();
         }
         catch (Exception ex)
         {
             statusMessage = $"Analysis failed: {ex.Message}";
         }
+    }
+
+    private void NavigateToAddress()
+    {
+        // Parse address
+        var addrStr = addressInput.Trim();
+        if (addrStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            addrStr = addrStr[2..];
+
+        if (!nint.TryParse(addrStr, NumberStyles.HexNumber, null, out var address) || address == 0)
+        {
+            statusMessage = "Invalid address format. Use hex like 0x1A2B3C4D";
+            return;
+        }
+
+        // Parse size
+        var sizeStr = sizeInput.Trim();
+        if (sizeStr.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            sizeStr = sizeStr[2..];
+
+        if (!int.TryParse(sizeStr, NumberStyles.HexNumber, null, out var size) || size <= 0)
+        {
+            size = 0x400;
+        }
+
+        // Get type if selected
+        string? typeName = null;
+        if (selectedTypeIndex >= 0 && selectedTypeIndex < allStructTypes.Count)
+        {
+            typeName = allStructTypes[selectedTypeIndex].FullName;
+
+            // Update size from type if available
+            var declaredSize = TypeResolver.GetDeclaredSize(allStructTypes[selectedTypeIndex]);
+            if (declaredSize.HasValue)
+                size = declaredSize.Value;
+        }
+
+        // Clear navigation history and start fresh
+        navigationHistory.Clear();
+        currentNavigation = NavigationEntry.FromAddress(address, size, typeName);
+        currentValidation = null;
+
+        AnalyzeCurrentNavigation();
+    }
+
+    /// <summary>
+    /// Navigate to a pointer target from a field.
+    /// </summary>
+    private void NavigateTo(nint address, int size, string? typeName, string sourceField, int sourceOffset)
+    {
+        if (address == 0)
+        {
+            statusMessage = "Cannot navigate to null pointer";
+            return;
+        }
+
+        // Push current to history
+        if (currentNavigation != null)
+        {
+            navigationHistory.Push(currentNavigation);
+        }
+
+        currentNavigation = NavigationEntry.FromPointer(address, size, typeName, sourceField, sourceOffset);
+        currentValidation = null;
+
+        AnalyzeCurrentNavigation();
+    }
+
+    private void NavigateBack()
+    {
+        if (navigationHistory.Count == 0)
+            return;
+
+        currentNavigation = navigationHistory.Pop();
+        AnalyzeCurrentNavigation();
+    }
+
+    private void AnalyzeCurrentNavigation()
+    {
+        if (currentNavigation == null)
+        {
+            currentLayout = null;
+            statusMessage = "No navigation target";
+            return;
+        }
+
+        statusMessage = "Analyzing...";
+
+        try
+        {
+            // Run memory analysis
+            currentLayout = MemoryAnalyzer.Analyze(
+                currentNavigation.Address,
+                currentNavigation.Size,
+                currentNavigation.TypeName ?? "");
+
+            // Update with type info if we have it
+            if (!string.IsNullOrEmpty(currentNavigation.TypeName))
+            {
+                var type = TypeResolver.FindType(currentNavigation.TypeName);
+                if (type != null)
+                {
+                    LayoutComparator.UpdateWithDeclaredFieldsFromType(currentLayout, type);
+                }
+            }
+            else if (currentValidation != null)
+            {
+                // Use validation result if we have one (from singleton)
+                LayoutComparator.UpdateWithDeclaredFields(currentLayout, currentValidation);
+                currentComparison = LayoutComparator.Compare(currentLayout, currentValidation);
+            }
+
+            statusMessage = $"Analyzed {currentLayout.Fields.Count} fields, {currentLayout.Summary.MatchedFields} matched, {currentLayout.Summary.UndocumentedFields} undocumented";
+            selectedField = null;
+
+            // Update address input to show current address
+            addressInput = $"0x{currentNavigation.Address:X}";
+            sizeInput = $"0x{currentNavigation.Size:X}";
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Analysis failed: {ex.Message}";
+            currentLayout = null;
+        }
+    }
+
+    /// <summary>
+    /// Try to resolve the pointer target type from field info.
+    /// </summary>
+    private string? TryResolvePointerType(DiscoveredField field)
+    {
+        // If we have declared type info like "Character*" or "Pointer<Character>"
+        if (!string.IsNullOrEmpty(field.DeclaredType))
+        {
+            var resolvedType = TypeResolver.ResolvePointerTargetType(field.DeclaredType);
+            if (resolvedType != null)
+                return resolvedType.FullName;
+        }
+
+        // Try vtable detection
+        if (field.PointerTarget.HasValue && field.PointerTarget.Value != 0)
+        {
+            var detected = TypeResolver.ResolveFromVTable(field.PointerTarget.Value);
+            if (detected != null)
+                return detected.FullName;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Get size for a pointer target, using type info if available.
+    /// </summary>
+    private int GetPointerTargetSize(string? typeName)
+    {
+        if (!string.IsNullOrEmpty(typeName))
+        {
+            var type = TypeResolver.FindType(typeName);
+            if (type != null)
+            {
+                var size = TypeResolver.GetDeclaredSize(type);
+                if (size.HasValue)
+                    return size.Value;
+            }
+        }
+        return 0x400; // Default size
     }
 
     private void DrawMainContent()
@@ -237,8 +608,8 @@ public class MemoryExplorerWindow : Window, IDisposable
 
         // Split view
         var availableWidth = ImGui.GetContentRegionAvail().X;
-        var listWidth = availableWidth * 0.5f;
-        var detailWidth = availableWidth * 0.5f - 10;
+        var listWidth = availableWidth * 0.55f;
+        var detailWidth = availableWidth * 0.45f - 10;
 
         // Left panel - field list
         if (ImGui.BeginChild("FieldList", new Vector2(listWidth, -1), true))
@@ -308,13 +679,15 @@ public class MemoryExplorerWindow : Window, IDisposable
     {
         if (currentLayout == null) return;
 
-        if (ImGui.BeginTable("DiscoveredFieldsTable", 5, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY))
+        // Add a column for explore button
+        if (ImGui.BeginTable("DiscoveredFieldsTable", 6, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY))
         {
-            ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.None, 60);
-            ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.None, 80);
-            ImGui.TableSetupColumn("Conf", ImGuiTableColumnFlags.None, 40);
-            ImGui.TableSetupColumn("Declared", ImGuiTableColumnFlags.None, 100);
-            ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.None, 100);
+            ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.None, 55);
+            ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.None, 70);
+            ImGui.TableSetupColumn("Conf", ImGuiTableColumnFlags.None, 35);
+            ImGui.TableSetupColumn("Declared", ImGuiTableColumnFlags.None, 90);
+            ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.None, 90);
+            ImGui.TableSetupColumn("", ImGuiTableColumnFlags.None, 50); // Explore button
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableHeadersRow();
 
@@ -353,7 +726,39 @@ public class MemoryExplorerWindow : Window, IDisposable
                 ImGui.TableNextColumn();
                 ImGui.Text(field.DeclaredName ?? "");
                 ImGui.TableNextColumn();
-                ImGui.Text(TruncateValue(field.Value, 15));
+                ImGui.Text(TruncateValue(field.Value, 12));
+                ImGui.TableNextColumn();
+
+                // Explore button for pointers
+                if (field.InferredType is InferredTypeKind.Pointer or InferredTypeKind.VTablePointer or InferredTypeKind.StringPointer)
+                {
+                    if (field.PointerTarget.HasValue && field.PointerTarget.Value != 0)
+                    {
+                        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.4f, 0.6f, 1.0f));
+                        if (ImGui.SmallButton($"->##ptr{field.Offset}"))
+                        {
+                            var targetType = TryResolvePointerType(field);
+                            var targetSize = GetPointerTargetSize(targetType);
+                            NavigateTo(
+                                field.PointerTarget.Value,
+                                targetSize,
+                                targetType,
+                                field.DeclaredName ?? $"0x{field.Offset:X}",
+                                field.Offset);
+                        }
+                        ImGui.PopStyleColor();
+
+                        if (ImGui.IsItemHovered())
+                        {
+                            ImGui.BeginTooltip();
+                            ImGui.Text($"Explore 0x{field.PointerTarget.Value:X}");
+                            var targetType = TryResolvePointerType(field);
+                            if (!string.IsNullOrEmpty(targetType))
+                                ImGui.Text($"Type: {targetType.Split('.').Last()}");
+                            ImGui.EndTooltip();
+                        }
+                    }
+                }
 
                 ImGui.PopStyleColor();
             }
@@ -410,10 +815,28 @@ public class MemoryExplorerWindow : Window, IDisposable
             ImGui.Text($"Value: {field.Value}");
         }
 
-        // Pointer target
+        // Pointer target with explore button
         if (field.PointerTarget.HasValue && field.PointerTarget.Value != 0)
         {
             ImGui.Text($"Points to: 0x{field.PointerTarget.Value:X}");
+
+            var targetType = TryResolvePointerType(field);
+            if (!string.IsNullOrEmpty(targetType))
+            {
+                ImGui.Text($"Target type: {targetType.Split('.').Last()}");
+            }
+
+            ImGui.Spacing();
+            if (ImGui.Button($"Explore Target##exploreDetail"))
+            {
+                var targetSize = GetPointerTargetSize(targetType);
+                NavigateTo(
+                    field.PointerTarget.Value,
+                    targetSize,
+                    targetType,
+                    field.DeclaredName ?? $"0x{field.Offset:X}",
+                    field.Offset);
+            }
         }
 
         ImGui.Separator();
@@ -440,7 +863,7 @@ public class MemoryExplorerWindow : Window, IDisposable
             var report = new DiscoveryReport
             {
                 Timestamp = DateTime.UtcNow,
-                GameVersion = "Unknown", // Would get from FFXIVClientStructs assembly
+                GameVersion = "Unknown",
                 Layouts = new List<DiscoveredLayout> { currentLayout },
                 Summary = new DiscoveryReportSummary
                 {
@@ -451,9 +874,10 @@ public class MemoryExplorerWindow : Window, IDisposable
                 }
             };
 
+            var structName = currentLayout.StructName.Split('.').LastOrDefault() ?? "Unknown";
             var path = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-                $"discovery-{currentLayout.StructName.Split('.').Last()}-{DateTime.Now:yyyyMMdd-HHmmss}.json"
+                $"discovery-{structName}-{DateTime.Now:yyyyMMdd-HHmmss}.json"
             );
 
             var json = JsonSerializer.Serialize(report, new JsonSerializerOptions
@@ -477,9 +901,10 @@ public class MemoryExplorerWindow : Window, IDisposable
 
         try
         {
+            var structName = currentLayout.StructName.Split('.').LastOrDefault() ?? "Unknown";
             var path = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-                $"discovery-{currentLayout.StructName.Split('.').Last()}-{DateTime.Now:yyyyMMdd-HHmmss}.yaml"
+                $"discovery-{structName}-{DateTime.Now:yyyyMMdd-HHmmss}.yaml"
             );
 
             using var writer = new StreamWriter(path);
@@ -489,7 +914,7 @@ public class MemoryExplorerWindow : Window, IDisposable
             writer.WriteLine($"# Address: 0x{currentLayout.BaseAddress:X}");
             writer.WriteLine();
             writer.WriteLine("structs:");
-            writer.WriteLine($"  - type: {currentLayout.StructName.Split('.').Last()}_Discovered");
+            writer.WriteLine($"  - type: {structName}_Discovered");
             writer.WriteLine($"    size: 0x{currentLayout.AnalyzedSize:X}");
             writer.WriteLine("    fields:");
 
