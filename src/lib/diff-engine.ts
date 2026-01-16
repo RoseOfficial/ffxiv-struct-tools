@@ -921,6 +921,249 @@ function generatePatternSummary(
 }
 
 // ============================================================================
+// Cascading Pattern Detection
+// ============================================================================
+
+export interface CascadingPattern {
+  /** The base struct that caused the cascade */
+  sourceStruct: string;
+  /** Size increase in the base struct */
+  sizeDelta: number;
+  /** All affected child structs */
+  affectedStructs: string[];
+  /** Field offset delta in children */
+  offsetDelta: number;
+  /** Confidence score (0-1) */
+  confidence: number;
+  /** Whether this looks like a base class size increase */
+  isSizeIncrease: boolean;
+}
+
+export interface CrossHierarchyPattern {
+  /** Description of the cross-hierarchy pattern */
+  description: string;
+  /** Common delta across hierarchies */
+  delta: number;
+  /** Hierarchies that share this pattern */
+  hierarchies: string[];
+  /** Total affected structs */
+  affectedCount: number;
+  /** Confidence score */
+  confidence: number;
+}
+
+export interface PatchSuggestion {
+  /** Struct name pattern (supports wildcards) */
+  structPattern: string;
+  /** Offset delta to apply */
+  delta: number;
+  /** Starting offset for the shift */
+  startOffset: number;
+  /** Confidence of this suggestion */
+  confidence: number;
+  /** Human-readable description */
+  description: string;
+  /** CLI command to apply this patch */
+  command: string;
+}
+
+/**
+ * Detect cascading offset shifts caused by base class size changes
+ * When a parent struct grows, all children need their inherited offsets shifted
+ */
+export function detectCascadingPatterns(
+  oldStructs: YamlStruct[],
+  newStructs: YamlStruct[],
+  structDiffs: StructDiff[]
+): CascadingPattern[] {
+  const patterns: CascadingPattern[] = [];
+
+  // Build parent-child relationships
+  const oldMap = new Map(oldStructs.map(s => [s.type, s]));
+  const newMap = new Map(newStructs.map(s => [s.type, s]));
+
+  // Find structs with size changes
+  const sizeChanges = structDiffs
+    .filter(d => d.type === 'modified' && d.oldSize !== undefined && d.newSize !== undefined)
+    .filter(d => d.newSize! !== d.oldSize!)
+    .map(d => ({
+      name: d.structName,
+      oldSize: d.oldSize!,
+      newSize: d.newSize!,
+      delta: d.newSize! - d.oldSize!,
+    }));
+
+  for (const sizeChange of sizeChanges) {
+    // Find all structs that inherit from this one
+    const children: string[] = [];
+    for (const struct of oldStructs) {
+      if (struct.base === sizeChange.name) {
+        children.push(struct.type);
+      }
+    }
+
+    if (children.length === 0) continue;
+
+    // Check if children have matching offset shifts
+    let matchingChildCount = 0;
+    const childrenWithMatchingShifts: string[] = [];
+
+    for (const childName of children) {
+      const childDiff = structDiffs.find(d => d.structName === childName);
+      if (!childDiff || childDiff.type !== 'modified') continue;
+
+      // Check if field offsets shifted by the expected amount
+      const shiftedFields = childDiff.fieldChanges.filter(fc => {
+        if (fc.type !== 'modified' || fc.oldOffset === undefined || fc.newOffset === undefined) return false;
+        const delta = fc.newOffset - fc.oldOffset;
+        // Field must be after the base struct's old size (inherited region)
+        return delta === sizeChange.delta && fc.oldOffset >= sizeChange.oldSize;
+      });
+
+      if (shiftedFields.length > 0) {
+        matchingChildCount++;
+        childrenWithMatchingShifts.push(childName);
+      }
+    }
+
+    if (matchingChildCount > 0) {
+      const confidence = matchingChildCount / children.length;
+
+      patterns.push({
+        sourceStruct: sizeChange.name,
+        sizeDelta: sizeChange.delta,
+        affectedStructs: childrenWithMatchingShifts,
+        offsetDelta: sizeChange.delta,
+        confidence,
+        isSizeIncrease: sizeChange.delta > 0,
+      });
+    }
+  }
+
+  // Sort by confidence
+  patterns.sort((a, b) => b.confidence - a.confidence);
+
+  return patterns;
+}
+
+/**
+ * Detect patterns that span multiple inheritance hierarchies
+ * This can indicate engine-wide changes (e.g., new field added to common base)
+ */
+export function detectCrossHierarchyPatterns(
+  hierarchyDeltas: HierarchyDeltaCandidate[]
+): CrossHierarchyPattern[] {
+  const patterns: CrossHierarchyPattern[] = [];
+
+  // Group hierarchy deltas by their delta value
+  const byDelta = new Map<number, HierarchyDeltaCandidate[]>();
+  for (const hd of hierarchyDeltas) {
+    if (!byDelta.has(hd.delta)) {
+      byDelta.set(hd.delta, []);
+    }
+    byDelta.get(hd.delta)!.push(hd);
+  }
+
+  // Look for deltas that appear in multiple hierarchies
+  for (const [delta, candidates] of byDelta) {
+    if (candidates.length < 2) continue;
+
+    const totalAffected = candidates.reduce((sum, c) => sum + c.structNames.length, 0);
+    const avgConfidence = candidates.reduce((sum, c) => sum + c.confidence, 0) / candidates.length;
+
+    patterns.push({
+      description: `Common ${delta > 0 ? '+' : ''}${toHex(delta)} shift across ${candidates.length} hierarchies`,
+      delta,
+      hierarchies: candidates.map(c => c.hierarchy),
+      affectedCount: totalAffected,
+      confidence: avgConfidence * (candidates.length / hierarchyDeltas.length + 0.5),
+    });
+  }
+
+  patterns.sort((a, b) => b.confidence - a.confidence);
+
+  return patterns;
+}
+
+/**
+ * Generate patch command suggestions from detected patterns
+ */
+export function generatePatchSuggestions(
+  hierarchyDeltas: HierarchyDeltaCandidate[],
+  cascadingPatterns: CascadingPattern[],
+  crossHierarchyPatterns: CrossHierarchyPattern[]
+): PatchSuggestion[] {
+  const suggestions: PatchSuggestion[] = [];
+
+  // Generate suggestions from hierarchy deltas
+  for (const hd of hierarchyDeltas) {
+    if (hd.confidence < 0.5) continue;
+
+    const structPattern = hd.structNames.length === 1
+      ? hd.structNames[0]
+      : `${hd.hierarchy}*`;
+
+    const sign = hd.delta > 0 ? '+' : '';
+    suggestions.push({
+      structPattern,
+      delta: hd.delta,
+      startOffset: hd.startOffset,
+      confidence: hd.confidence,
+      description: `Shift offsets ${sign}${toHex(hd.delta)} for ${hd.hierarchy} hierarchy (${hd.matchCount} fields match)`,
+      command: `fst patch --struct "${structPattern}" --delta ${sign}${toHex(hd.delta)} --start-offset ${toHex(hd.startOffset)}`,
+    });
+  }
+
+  // Generate suggestions from cascading patterns
+  for (const cp of cascadingPatterns) {
+    if (cp.confidence < 0.6) continue;
+
+    for (const childStruct of cp.affectedStructs) {
+      const sign = cp.offsetDelta > 0 ? '+' : '';
+      suggestions.push({
+        structPattern: childStruct,
+        delta: cp.offsetDelta,
+        startOffset: 0, // Cascading affects all inherited fields
+        confidence: cp.confidence * 0.9, // Slightly lower than direct pattern
+        description: `Cascade from ${cp.sourceStruct} size change: shift ${childStruct} offsets ${sign}${toHex(cp.offsetDelta)}`,
+        command: `fst patch --struct "${childStruct}" --delta ${sign}${toHex(cp.offsetDelta)}`,
+      });
+    }
+  }
+
+  // Generate suggestions from cross-hierarchy patterns
+  for (const chp of crossHierarchyPatterns) {
+    if (chp.confidence < 0.7) continue;
+
+    const sign = chp.delta > 0 ? '+' : '';
+    const hierarchyPatterns = chp.hierarchies.map(h => `${h}*`);
+
+    suggestions.push({
+      structPattern: hierarchyPatterns.join(', '),
+      delta: chp.delta,
+      startOffset: 0,
+      confidence: chp.confidence,
+      description: `Cross-hierarchy pattern: ${chp.description}`,
+      command: `# Apply to each hierarchy:\n${hierarchyPatterns.map(p =>
+        `fst patch --struct "${p}" --delta ${sign}${toHex(chp.delta)}`
+      ).join('\n')}`,
+    });
+  }
+
+  // Sort by confidence
+  suggestions.sort((a, b) => b.confidence - a.confidence);
+
+  // Deduplicate overlapping suggestions
+  const seen = new Set<string>();
+  return suggestions.filter(s => {
+    const key = `${s.structPattern}:${s.delta}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// ============================================================================
 // Full Diff Operation
 // ============================================================================
 
@@ -956,5 +1199,41 @@ export function diff(
     enums: enumDiffs,
     patterns,
     stats,
+  };
+}
+
+/**
+ * Extended diff with enhanced pattern detection and patch suggestions
+ */
+export function diffWithSuggestions(
+  oldStructs: YamlStruct[],
+  newStructs: YamlStruct[],
+  oldEnums: YamlEnum[],
+  newEnums: YamlEnum[]
+): {
+  result: DiffResult;
+  hierarchyDeltas: HierarchyDeltaCandidate[];
+  cascadingPatterns: CascadingPattern[];
+  crossHierarchyPatterns: CrossHierarchyPattern[];
+  patchSuggestions: PatchSuggestion[];
+} {
+  const result = diff(oldStructs, newStructs, oldEnums, newEnums);
+
+  // Run enhanced pattern detection
+  const hierarchyDeltas = detectHierarchyDeltas(oldStructs, newStructs, result.structs);
+  const cascadingPatterns = detectCascadingPatterns(oldStructs, newStructs, result.structs);
+  const crossHierarchyPatterns = detectCrossHierarchyPatterns(hierarchyDeltas);
+  const patchSuggestions = generatePatchSuggestions(
+    hierarchyDeltas,
+    cascadingPatterns,
+    crossHierarchyPatterns
+  );
+
+  return {
+    result,
+    hierarchyDeltas,
+    cascadingPatterns,
+    crossHierarchyPatterns,
+    patchSuggestions,
   };
 }

@@ -8,6 +8,7 @@
 
 import { program } from 'commander';
 import { runValidate, type ValidateOptions } from './commands/validate.js';
+import { runWatch, type WatchOptions } from './commands/watch.js';
 import { runDiff, type DiffOptions } from './commands/diff.js';
 import { runPatch, type PatchOptions } from './commands/patch.js';
 import { runExport, type ExportCommandOptions } from './commands/export.js';
@@ -30,6 +31,7 @@ import {
 import { createSigCommand } from './commands/sig.js';
 import { createDiscoverCommand } from './commands/discover.js';
 import { createImportCommand } from './commands/import.js';
+import { createSyncCommand } from './commands/sync.js';
 
 program
   .name('fst')
@@ -52,6 +54,28 @@ program
     await runValidate(patterns, options);
   });
 
+// watch command
+program
+  .command('watch')
+  .description('Monitor YAML files and auto-validate/export on change')
+  .argument('<patterns...>', 'YAML file paths or glob patterns to watch')
+  .option('-e, --export <format>', 'Auto-export on change (ida|reclass|ghidra|headers)')
+  .option('--no-validate', 'Disable validation on change')
+  .option('-d, --debounce <ms>', 'Debounce delay in milliseconds', '500')
+  .option('-o, --output <path>', 'Output path for exports')
+  .option('-n, --namespace <name>', 'Namespace for exported types')
+  .option('-s, --strict', 'Enable strict validation mode')
+  .option('-i, --ignore <rules...>', 'Ignore specific validation rules')
+  .option('--sync-reclass <file>', 'Watch ReClass.NET file and sync changes')
+  .option('--sync-direction <dir>', 'Sync direction: bidirectional, yaml-only, reclass-only', 'bidirectional')
+  .action(async (patterns: string[], options: WatchOptions) => {
+    // Parse debounce as number
+    if (typeof options.debounce === 'string') {
+      options.debounce = parseInt(options.debounce, 10);
+    }
+    await runWatch(patterns, options);
+  });
+
 // diff command
 program
   .command('diff')
@@ -59,6 +83,7 @@ program
   .argument('<old>', 'Old version file(s) or glob pattern')
   .argument('<new>', 'New version file(s) or glob pattern')
   .option('-p, --detect-patterns', 'Detect and report bulk offset shift patterns')
+  .option('-s, --suggest-patches', 'Detect patterns and suggest patch commands')
   .option('--json', 'Output results as JSON')
   .option('--summary', 'Show summary only')
   .option('--structs-only', 'Only show struct changes')
@@ -202,5 +227,8 @@ program.addCommand(createDiscoverCommand());
 
 // import command
 program.addCommand(createImportCommand());
+
+// sync command
+program.addCommand(createSyncCommand());
 
 program.parse();

@@ -767,6 +767,281 @@ export function validateCommonPatterns(
   return issues;
 }
 
+/**
+ * Rule: Agent structs should inherit from AgentInterface
+ * FFXIV Agents are UI state managers that follow a specific inheritance pattern
+ */
+export function validateAgentPattern(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  // Check if this looks like an Agent struct
+  const isAgentNamed = struct.type.startsWith('Agent') && struct.type !== 'AgentInterface';
+
+  if (!isAgentNamed) return issues;
+
+  // Check inheritance
+  if (!struct.base) {
+    issues.push({
+      severity: 'warning',
+      rule: 'agent-pattern',
+      message: `Agent struct '${struct.type}' should inherit from AgentInterface or another Agent`,
+      struct: struct.type,
+    });
+    return issues;
+  }
+
+  // Verify it inherits from AgentInterface (directly or indirectly)
+  const validBases = ['AgentInterface', 'AgentShow', 'AgentShop', 'AgentMap', 'AgentHUD'];
+  const inheritsAgent = struct.base.startsWith('Agent') || validBases.includes(struct.base);
+
+  if (!inheritsAgent) {
+    issues.push({
+      severity: 'warning',
+      rule: 'agent-pattern',
+      message: `Agent struct '${struct.type}' inherits from '${struct.base}' which may not be an Agent type`,
+      struct: struct.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: ATK UI component structs need AtkEventListener at offset 0
+ * ATK components use a common event handling pattern
+ */
+export function validateAtkComponentPattern(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  // Check if this is an ATK component
+  const isAtkComponent = struct.type.startsWith('Atk') &&
+    (struct.type.includes('Node') || struct.type.includes('Component'));
+
+  if (!isAtkComponent) return issues;
+
+  // Skip if it inherits (parent handles the vtable)
+  if (struct.base) return issues;
+
+  // Check for AtkEventListener or vtable space at offset 0
+  if (!struct.fields || struct.fields.length === 0) return issues;
+
+  const firstField = struct.fields.find(f => parseOffset(f.offset) === 0);
+  if (!firstField) {
+    issues.push({
+      severity: 'info',
+      rule: 'atk-component-pattern',
+      message: `ATK component '${struct.type}' has no field at offset 0 (expected AtkEventListener or vtable)`,
+      struct: struct.type,
+    });
+    return issues;
+  }
+
+  // Check if it's an event listener or pointer
+  const fieldType = firstField.type;
+  const isEventListener = fieldType.includes('AtkEventListener') ||
+    fieldType.includes('AtkResNode') ||
+    fieldType.includes('AtkComponentNode') ||
+    isPointerType(fieldType);
+
+  if (!isEventListener) {
+    issues.push({
+      severity: 'info',
+      rule: 'atk-component-pattern',
+      message: `ATK component '${struct.type}' has '${fieldType}' at offset 0 (typically AtkEventListener for event handling)`,
+      struct: struct.type,
+      field: firstField.name || firstField.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Character-derived structs need proper inheritance chain
+ * Character hierarchy: GameObject -> Character -> BattleChara -> PlayerCharacter
+ */
+export function validateCharacterHierarchy(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  const characterTypes = ['Character', 'BattleChara', 'PlayerCharacter', 'Companion', 'Mount', 'Ornament'];
+  const gameObjectTypes = ['GameObject', 'ClientObjectManager'];
+
+  // Check if this is a character-like struct
+  const isCharacterType = characterTypes.some(t => struct.type.includes(t));
+
+  if (!isCharacterType) return issues;
+
+  // PlayerCharacter should inherit from BattleChara
+  if (struct.type === 'PlayerCharacter' && struct.base !== 'BattleChara') {
+    issues.push({
+      severity: 'warning',
+      rule: 'character-hierarchy',
+      message: `PlayerCharacter should inherit from BattleChara (has: ${struct.base || 'none'})`,
+      struct: struct.type,
+    });
+  }
+
+  // BattleChara should inherit from Character
+  if (struct.type === 'BattleChara' && struct.base !== 'Character') {
+    issues.push({
+      severity: 'warning',
+      rule: 'character-hierarchy',
+      message: `BattleChara should inherit from Character (has: ${struct.base || 'none'})`,
+      struct: struct.type,
+    });
+  }
+
+  // Character should inherit from GameObject
+  if (struct.type === 'Character' && struct.base !== 'GameObject') {
+    issues.push({
+      severity: 'warning',
+      rule: 'character-hierarchy',
+      message: `Character should inherit from GameObject (has: ${struct.base || 'none'})`,
+      struct: struct.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Excel sheet accessor structs follow specific patterns
+ * Sheet readers have specific field patterns for row data access
+ */
+export function validateSheetReaderPattern(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  // Check if this looks like a sheet reader
+  const isSheetReader = struct.type.includes('Sheet') ||
+    struct.type.includes('Excel') ||
+    struct.type.endsWith('Row');
+
+  if (!isSheetReader) return issues;
+
+  // Only check in strict mode
+  if (!context.options.strict) return issues;
+
+  // Sheet classes often have specific patterns
+  if (struct.type.includes('ExcelSheet') && struct.fields) {
+    // Should have a Row type or template parameter
+    const hasRowField = struct.fields.some(f =>
+      f.type.includes('Row') || f.name?.toLowerCase().includes('row')
+    );
+
+    if (!hasRowField && !struct.type.includes('Row')) {
+      issues.push({
+        severity: 'info',
+        rule: 'sheet-reader-pattern',
+        message: `Excel sheet '${struct.type}' may be missing row type reference`,
+        struct: struct.type,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Singleton structs should have Instance() function pattern
+ * FFXIV singletons follow a specific instantiation pattern
+ */
+export function validateSingletonPattern(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  // Common singleton indicators in FFXIV
+  const singletonIndicators = [
+    'Manager', 'Module', 'System', 'Framework', 'Controller', 'Service',
+  ];
+
+  const isSingletonLike = singletonIndicators.some(s => struct.type.includes(s));
+
+  if (!isSingletonLike) return issues;
+
+  // Check if it has funcs (non-virtual functions)
+  if (!struct.funcs || struct.funcs.length === 0) return issues;
+
+  // Look for Instance() getter
+  const hasInstance = struct.funcs.some(f =>
+    f.name === 'Instance' ||
+    f.name === 'GetInstance' ||
+    f.name === 'Get'
+  );
+
+  // Only report in strict mode (not all managers are singletons)
+  if (!hasInstance && context.options.strict) {
+    issues.push({
+      severity: 'info',
+      rule: 'singleton-pattern',
+      message: `Manager/Module struct '${struct.type}' may be missing Instance() function`,
+      struct: struct.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Network packet structs should have proper alignment
+ * Network packets need specific alignment for serialization
+ */
+export function validateNetworkPacketAlignment(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  // Check if this looks like a network packet
+  const isPacket = struct.type.includes('Packet') ||
+    struct.type.includes('IPC') ||
+    struct.type.startsWith('Server') ||
+    struct.type.startsWith('Client');
+
+  if (!isPacket) return issues;
+
+  // Packets should typically be 4-byte aligned minimum
+  if (struct.size && struct.size % 4 !== 0) {
+    issues.push({
+      severity: 'warning',
+      rule: 'network-packet-alignment',
+      message: `Network packet '${struct.type}' size ${toHex(struct.size)} is not 4-byte aligned`,
+      struct: struct.type,
+    });
+  }
+
+  // Check for common packet header patterns
+  if (struct.fields && struct.fields.length > 0) {
+    const firstField = struct.fields[0];
+    const firstOffset = parseOffset(firstField.offset);
+
+    // IPC packets often start with a size or type field
+    if (firstOffset !== 0) {
+      issues.push({
+        severity: 'info',
+        rule: 'network-packet-alignment',
+        message: `Packet '${struct.type}' first field at ${toHex(firstOffset)} (packets typically start at offset 0)`,
+        struct: struct.type,
+      });
+    }
+  }
+
+  return issues;
+}
+
 // ============================================================================
 // Enum Validation Rules
 // ============================================================================
@@ -850,6 +1125,12 @@ const STRUCT_VALIDATORS: ValidatorFn[] = [
   validateLargeGaps,
   validateInheritanceSize,
   validateCommonPatterns,
+  validateAgentPattern,
+  validateAtkComponentPattern,
+  validateCharacterHierarchy,
+  validateSheetReaderPattern,
+  validateSingletonPattern,
+  validateNetworkPacketAlignment,
 ];
 
 /**

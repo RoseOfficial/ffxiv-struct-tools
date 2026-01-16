@@ -8,6 +8,7 @@ import { parseYamlFile, type ParsedFile } from '../lib/yaml-parser.js';
 import {
   diff,
   diffStructs,
+  diffWithSuggestions,
   detectHierarchyDeltas,
   type DiffResult,
   type StructDiff,
@@ -16,11 +17,15 @@ import {
   type FuncChange,
   type VFuncChange,
   type HierarchyDeltaCandidate,
+  type CascadingPattern,
+  type CrossHierarchyPattern,
+  type PatchSuggestion,
 } from '../lib/diff-engine.js';
 import { toHex } from '../lib/types.js';
 
 export interface DiffOptions {
   detectPatterns?: boolean;
+  suggestPatches?: boolean;
   json?: boolean;
   summary?: boolean;
   structsOnly?: boolean;
@@ -81,28 +86,47 @@ export async function runDiff(
   const oldEnums = oldFiles.flatMap(f => f.enums);
   const newEnums = newFiles.flatMap(f => f.enums);
 
-  // Run diff
-  const result = diff(oldStructs, newStructs, oldEnums, newEnums);
-
-  // Detect hierarchy deltas for enhanced pattern display
+  // Run diff with or without suggestions
+  let result: DiffResult;
   let hierarchyDeltas: HierarchyDeltaCandidate[] = [];
-  if (options.detectPatterns) {
-    const structDiffs = diffStructs(oldStructs, newStructs);
-    hierarchyDeltas = detectHierarchyDeltas(oldStructs, newStructs, structDiffs);
+  let cascadingPatterns: CascadingPattern[] = [];
+  let crossHierarchyPatterns: CrossHierarchyPattern[] = [];
+  let patchSuggestions: PatchSuggestion[] = [];
+
+  if (options.suggestPatches) {
+    // Use enhanced diff with all pattern detection
+    const enhanced = diffWithSuggestions(oldStructs, newStructs, oldEnums, newEnums);
+    result = enhanced.result;
+    hierarchyDeltas = enhanced.hierarchyDeltas;
+    cascadingPatterns = enhanced.cascadingPatterns;
+    crossHierarchyPatterns = enhanced.crossHierarchyPatterns;
+    patchSuggestions = enhanced.patchSuggestions;
+  } else {
+    // Standard diff
+    result = diff(oldStructs, newStructs, oldEnums, newEnums);
+
+    // Detect hierarchy deltas for enhanced pattern display if requested
+    if (options.detectPatterns) {
+      const structDiffs = diffStructs(oldStructs, newStructs);
+      hierarchyDeltas = detectHierarchyDeltas(oldStructs, newStructs, structDiffs);
+    }
   }
 
   // Output results
   if (options.json) {
     const jsonResult = {
       ...result,
-      hierarchyDeltas: options.detectPatterns ? hierarchyDeltas : undefined,
+      hierarchyDeltas: (options.detectPatterns || options.suggestPatches) ? hierarchyDeltas : undefined,
+      cascadingPatterns: options.suggestPatches ? cascadingPatterns : undefined,
+      crossHierarchyPatterns: options.suggestPatches ? crossHierarchyPatterns : undefined,
+      patchSuggestions: options.suggestPatches ? patchSuggestions : undefined,
     };
     console.log(JSON.stringify(jsonResult, null, 2));
     return;
   }
 
   // Print human-readable diff
-  printDiffResult(result, options, hierarchyDeltas);
+  printDiffResult(result, options, hierarchyDeltas, cascadingPatterns, patchSuggestions);
 }
 
 /**
@@ -111,12 +135,19 @@ export async function runDiff(
 function printDiffResult(
   result: DiffResult,
   options: DiffOptions,
-  hierarchyDeltas: HierarchyDeltaCandidate[] = []
+  hierarchyDeltas: HierarchyDeltaCandidate[] = [],
+  cascadingPatterns: CascadingPattern[] = [],
+  patchSuggestions: PatchSuggestion[] = []
 ): void {
   const { structs, enums, patterns, stats } = result;
 
+  // Print patch suggestions if available
+  if (options.suggestPatches && patchSuggestions.length > 0) {
+    printPatchSuggestions(patchSuggestions, cascadingPatterns);
+  }
+
   // Print hierarchy-aware pattern analysis first if detected
-  if (options.detectPatterns && hierarchyDeltas.length > 0) {
+  if ((options.detectPatterns || options.suggestPatches) && hierarchyDeltas.length > 0) {
     printHierarchyPatterns(hierarchyDeltas);
   } else if (options.detectPatterns && patterns.summary !== 'No consistent patterns detected') {
     // Fallback to original pattern display
@@ -372,6 +403,71 @@ function getChangeColor(type: string): (text: string) => string {
     case 'modified': return chalk.yellow;
     default: return chalk.white;
   }
+}
+
+/**
+ * Print patch suggestions
+ */
+function printPatchSuggestions(
+  suggestions: PatchSuggestion[],
+  cascadingPatterns: CascadingPattern[]
+): void {
+  console.log(chalk.cyan.bold('═══════════════════════════════════════════════════════════════'));
+  console.log(chalk.cyan.bold('  SUGGESTED PATCH COMMANDS'));
+  console.log(chalk.cyan.bold('═══════════════════════════════════════════════════════════════'));
+  console.log();
+
+  // Print cascading patterns first if any
+  if (cascadingPatterns.length > 0) {
+    console.log(chalk.yellow.bold('  Cascading Patterns Detected:'));
+    console.log(chalk.yellow('  ─────────────────────────────'));
+    for (const cp of cascadingPatterns) {
+      const sign = cp.sizeDelta > 0 ? '+' : '';
+      console.log(chalk.white(`  • ${cp.sourceStruct} size changed ${sign}${toHex(cp.sizeDelta)}`));
+      console.log(chalk.gray(`    → Affects ${cp.affectedStructs.length} child struct(s): ${cp.affectedStructs.slice(0, 3).join(', ')}${cp.affectedStructs.length > 3 ? '...' : ''}`));
+    }
+    console.log();
+  }
+
+  // Group suggestions by confidence level
+  const highConfidence = suggestions.filter(s => s.confidence >= 0.7);
+  const mediumConfidence = suggestions.filter(s => s.confidence >= 0.5 && s.confidence < 0.7);
+
+  if (highConfidence.length > 0) {
+    console.log(chalk.green.bold('  High Confidence Patches (≥70%):'));
+    console.log(chalk.green('  ────────────────────────────────'));
+    for (const suggestion of highConfidence.slice(0, 10)) {
+      printSuggestion(suggestion, chalk.green);
+    }
+    console.log();
+  }
+
+  if (mediumConfidence.length > 0) {
+    console.log(chalk.yellow.bold('  Medium Confidence Patches (50-70%):'));
+    console.log(chalk.yellow('  ────────────────────────────────────'));
+    for (const suggestion of mediumConfidence.slice(0, 5)) {
+      printSuggestion(suggestion, chalk.yellow);
+    }
+    console.log();
+  }
+
+  // Print summary
+  console.log(chalk.cyan('───────────────────────────────────────────────────────────────'));
+  console.log(chalk.white(`  Total: ${suggestions.length} patch suggestions`));
+  console.log(chalk.white(`         ${highConfidence.length} high confidence, ${mediumConfidence.length} medium confidence`));
+  console.log();
+  console.log(chalk.gray('  Tip: Copy and run the suggested commands, or use --json for automation'));
+  console.log(chalk.cyan('═══════════════════════════════════════════════════════════════'));
+  console.log();
+}
+
+function printSuggestion(suggestion: PatchSuggestion, color: typeof chalk.green): void {
+  const confidenceBar = '█'.repeat(Math.floor(suggestion.confidence * 10)) +
+                        '░'.repeat(10 - Math.floor(suggestion.confidence * 10));
+  console.log(color(`  [${confidenceBar}] ${(suggestion.confidence * 100).toFixed(0)}%`));
+  console.log(chalk.white(`    ${suggestion.description}`));
+  console.log(chalk.gray(`    $ ${suggestion.command}`));
+  console.log();
 }
 
 /**

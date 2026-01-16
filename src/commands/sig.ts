@@ -25,6 +25,12 @@ import {
   SIGNATURE_TYPE_WEIGHTS,
 } from '../lib/signatures.js';
 import {
+  validateSignatures,
+  groupIssuesByStruct,
+  detectBulkShifts,
+  type SignatureValidationResult,
+} from '../lib/signature-validator.js';
+import {
   BinaryScanner,
   generateCandidatePatterns,
   detectGameVersion,
@@ -49,6 +55,12 @@ export interface SigScanOptions {
 }
 
 export interface SigStatusOptions {
+  json?: boolean;
+}
+
+export interface SigValidateOptions {
+  report?: string;
+  fix?: boolean;
   json?: boolean;
 }
 
@@ -536,6 +548,218 @@ export async function runSigStatus(
 }
 
 // ============================================================================
+// Validate Command
+// ============================================================================
+
+/**
+ * Validate signatures against YAML definitions
+ */
+export async function runSigValidate(
+  sigPatterns: string[],
+  yamlPatterns: string[],
+  options: SigValidateOptions
+): Promise<void> {
+  // Find signature files
+  const sigPaths: string[] = [];
+  for (const pattern of sigPatterns) {
+    const matches = await glob(pattern, { nodir: true });
+    sigPaths.push(...matches);
+  }
+
+  if (sigPaths.length === 0) {
+    console.error(chalk.red('No signature files found matching the provided patterns'));
+    process.exit(1);
+  }
+
+  // Find YAML files
+  const yamlPaths: string[] = [];
+  for (const pattern of yamlPatterns) {
+    const matches = await glob(pattern, { nodir: true });
+    yamlPaths.push(...matches);
+  }
+
+  if (yamlPaths.length === 0) {
+    console.error(chalk.red('No YAML files found matching the provided patterns'));
+    process.exit(1);
+  }
+
+  console.log(chalk.blue(`Loading ${sigPaths.length} signature file(s)...`));
+
+  // Load signature files
+  const sigCollections: StructSignatures[] = [];
+  for (const sigPath of sigPaths) {
+    try {
+      const content = fs.readFileSync(sigPath, 'utf-8');
+      if (sigPath.endsWith('.json')) {
+        const data = JSON.parse(content);
+        if (Array.isArray(data)) {
+          sigCollections.push(...data);
+        } else {
+          sigCollections.push(data);
+        }
+      } else {
+        try {
+          const data = JSON.parse(content);
+          if (Array.isArray(data)) {
+            sigCollections.push(...data);
+          } else {
+            sigCollections.push(data);
+          }
+        } catch {
+          console.warn(chalk.yellow(`  Warning: Could not parse ${sigPath}, skipping`));
+        }
+      }
+    } catch (error) {
+      console.error(chalk.red(`Failed to load ${sigPath}:`), error);
+    }
+  }
+
+  if (sigCollections.length === 0) {
+    console.error(chalk.red('No valid signatures loaded'));
+    process.exit(1);
+  }
+
+  console.log(chalk.blue(`Loading ${yamlPaths.length} YAML file(s)...`));
+
+  // Parse YAML files
+  const parsedFiles: ParsedFile[] = [];
+  for (const yamlPath of yamlPaths) {
+    try {
+      parsedFiles.push(parseYamlFile(yamlPath));
+    } catch (error) {
+      console.error(chalk.red(`Failed to parse ${yamlPath}:`), error);
+      process.exit(1);
+    }
+  }
+
+  // Aggregate all structs
+  const allStructs = parsedFiles.flatMap((f) => f.structs);
+
+  console.log(chalk.blue('\nValidating signatures against YAML definitions...\n'));
+
+  // Run validation
+  const result = validateSignatures(sigCollections, allStructs);
+
+  // Output results
+  if (options.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  // Print validation results
+  printValidationResult(result, options);
+
+  // Write report if requested
+  if (options.report) {
+    const reportData = JSON.stringify(result, null, 2);
+    fs.writeFileSync(options.report, reportData);
+    console.log(chalk.green(`\nReport written to: ${options.report}`));
+  }
+
+  // Exit with error if there are errors
+  const errors = result.issues.filter((i) => i.severity === 'error').length;
+  if (errors > 0) {
+    process.exit(1);
+  }
+}
+
+/**
+ * Print validation result in human-readable format
+ */
+function printValidationResult(
+  result: SignatureValidationResult,
+  options: SigValidateOptions
+): void {
+  // Print summary first
+  console.log(chalk.blue('───────────────────────────────────────────────────────────────'));
+  console.log(chalk.blue('Signature Validation Summary'));
+  console.log(chalk.blue('───────────────────────────────────────────────────────────────\n'));
+
+  console.log(`Signatures checked:  ${result.signaturesChecked}`);
+  console.log(`  ${chalk.green('✓')} Valid:           ${result.signaturesValid}`);
+  console.log(`  ${chalk.red('✗')} With issues:     ${result.signaturesWithIssues}`);
+  console.log();
+  console.log(`Struct coverage:     ${result.structsCovered} with signatures, ${result.structsWithoutSignatures} without`);
+  console.log(`Field coverage:      ${result.fieldsCoverage.covered}/${result.fieldsCoverage.total} (${result.fieldsCoverage.percentage}%)`);
+
+  // Print issues grouped by struct
+  if (result.issues.length > 0) {
+    console.log(chalk.blue('\n───────────────────────────────────────────────────────────────'));
+    console.log(chalk.blue('Issues Found'));
+    console.log(chalk.blue('───────────────────────────────────────────────────────────────\n'));
+
+    const groupedIssues = groupIssuesByStruct(result.issues);
+
+    for (const [structName, issues] of groupedIssues) {
+      console.log(chalk.cyan(`${structName}:`));
+
+      for (const issue of issues) {
+        const icon = issue.severity === 'error' ? chalk.red('✗') :
+                     issue.severity === 'warning' ? chalk.yellow('⚠') :
+                     chalk.blue('ℹ');
+        const color = issue.severity === 'error' ? chalk.red :
+                      issue.severity === 'warning' ? chalk.yellow :
+                      chalk.white;
+
+        const fieldInfo = issue.fieldName ? `[${issue.fieldName}] ` : '';
+        console.log(`  ${icon} ${fieldInfo}${color(issue.message)}`);
+
+        if (issue.suggestedFix && options.fix) {
+          console.log(chalk.gray(`      Fix: ${issue.suggestedFix}`));
+        }
+      }
+
+      console.log();
+    }
+  }
+
+  // Detect and print bulk shifts
+  const bulkShifts = detectBulkShifts(result.issues);
+  if (bulkShifts.length > 0) {
+    console.log(chalk.blue('───────────────────────────────────────────────────────────────'));
+    console.log(chalk.blue('Detected Bulk Offset Shifts'));
+    console.log(chalk.blue('───────────────────────────────────────────────────────────────\n'));
+
+    for (const shift of bulkShifts) {
+      const sign = shift.delta >= 0 ? '+' : '';
+      console.log(chalk.yellow(`  ${sign}${toHex(shift.delta)} shift detected (${shift.count} fields in ${shift.structs.length} struct(s))`));
+      console.log(chalk.gray(`    ${shift.command}`));
+      console.log();
+    }
+  }
+
+  // Print suggested patches
+  if (result.suggestedPatches.length > 0 && options.fix) {
+    console.log(chalk.blue('───────────────────────────────────────────────────────────────'));
+    console.log(chalk.blue('Suggested Fixes'));
+    console.log(chalk.blue('───────────────────────────────────────────────────────────────\n'));
+
+    for (const patch of result.suggestedPatches.slice(0, 20)) {
+      console.log(chalk.gray(patch.command));
+    }
+
+    if (result.suggestedPatches.length > 20) {
+      console.log(chalk.gray(`  ... and ${result.suggestedPatches.length - 20} more`));
+    }
+  }
+
+  // Final status
+  console.log(chalk.blue('\n───────────────────────────────────────────────────────────────'));
+
+  const errors = result.issues.filter((i) => i.severity === 'error').length;
+  const warnings = result.issues.filter((i) => i.severity === 'warning').length;
+
+  if (errors === 0 && warnings === 0) {
+    console.log(chalk.green('✓ All signatures valid!'));
+  } else {
+    console.log(chalk.red(`${errors} error(s), `) + chalk.yellow(`${warnings} warning(s)`));
+    if (errors > 0) {
+      console.log(chalk.gray('  Run with --fix to see suggested fixes'));
+    }
+  }
+}
+
+// ============================================================================
 // Command Registration
 // ============================================================================
 
@@ -575,6 +799,18 @@ export function createSigCommand(): Command {
     .option('--json', 'Output as JSON')
     .action(async (patterns: string[], options: SigStatusOptions) => {
       await runSigStatus(patterns, options);
+    });
+
+  cmd
+    .command('validate')
+    .description('Validate signatures against YAML definitions')
+    .argument('<signatures>', 'Signature file paths or glob pattern')
+    .argument('<yaml-patterns...>', 'YAML file paths or glob patterns')
+    .option('-r, --report <path>', 'Generate detailed report to file')
+    .option('--fix', 'Show suggested fixes for mismatches')
+    .option('--json', 'Output as JSON')
+    .action(async (signatures: string, yamlPatterns: string[], options: SigValidateOptions) => {
+      await runSigValidate([signatures], yamlPatterns, options);
     });
 
   return cmd;

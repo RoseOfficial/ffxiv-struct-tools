@@ -4,6 +4,10 @@ node_modules/
 # Build output
 dist/
 
+# Dalamud plugin build output
+dalamud-plugin/**/bin/
+dalamud-plugin/**/obj/
+
 # IDE
 .idea/
 .vscode/
@@ -34,3 +38,5 @@ CLAUDE.md
 # Signature files (binary-specific, regenerate per machine)
 *.sigs.json
 *.sigs.yaml
+test-sigs.json
+test-small-sigs.json
