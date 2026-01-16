@@ -29,6 +29,7 @@ import {
 } from './commands/vtables.js';
 import { createSigCommand } from './commands/sig.js';
 import { createDiscoverCommand } from './commands/discover.js';
+import { createImportCommand } from './commands/import.js';
 
 program
   .name('fst')
@@ -198,5 +199,8 @@ program.addCommand(createSigCommand());
 
 // discover command
 program.addCommand(createDiscoverCommand());
+
+// import command
+program.addCommand(createImportCommand());
 
 program.parse();

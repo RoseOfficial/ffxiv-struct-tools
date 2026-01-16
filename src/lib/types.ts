@@ -119,6 +119,48 @@ export const TYPE_SIZES: Record<string, number> = {
 };
 
 // ============================================================================
+// Known FFXIV-Specific Type Sizes
+// These are FFXIV game engine types with fixed sizes.
+// Used for validation and pattern recognition.
+// ============================================================================
+
+export const FFXIV_TYPE_SIZES: Record<string, number> = {
+  // String types
+  'Utf8String': 0x68,
+  'CString': 0x8,   // Just a pointer
+
+  // STL containers (FFXIV uses custom implementations with known sizes)
+  'StdString': 0x20,
+  'StdVector': 0x18,
+  'StdMap': 0x10,
+  'StdSet': 0x10,
+  'StdDeque': 0x28,
+  'StdList': 0x10,
+
+  // ATK UI types
+  'AtkValue': 0x10,
+  'AtkArrayData': 0x20,
+  'AtkEventListener': 0x8,  // Just a vtable pointer
+
+  // Math types
+  'Vector2': 0x8,
+  'Vector3': 0xC,
+  'Vector4': 0x10,
+  'Matrix4x4': 0x40,
+  'Quaternion': 0x10,
+
+  // Lumina/SE types
+  'Lumina.Text.SeString': 0x68,
+  'SeString': 0x68,
+
+  // Client types
+  'ClientObjectId': 0x8,
+  'ContentId': 0x8,
+  'EntityId': 0x4,
+  'ObjectId': 0x4,
+};
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 

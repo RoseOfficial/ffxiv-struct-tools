@@ -11,6 +11,12 @@ import yaml from 'js-yaml';
 import type { YamlData, YamlStruct, YamlEnum } from '../lib/types.js';
 import { parseOffset, toHex, extractBaseType } from '../lib/types.js';
 import { diff, DiffResult } from '../lib/diff-engine.js';
+import {
+  analyzeComplexity,
+  generateInheritanceMermaid,
+  formatComplexityTable,
+  type ComplexityReport,
+} from '../lib/analyzers/complexity.js';
 
 interface ReportOptions {
   format?: 'markdown' | 'html' | 'json';
@@ -21,6 +27,7 @@ interface ReportOptions {
   changelog?: string;
   depth?: string;
   title?: string;
+  complexity?: boolean;
 }
 
 interface StructInfo {
@@ -44,6 +51,7 @@ export function createReportCommand(): Command {
     .option('--changelog <old-files>', 'Generate changelog by comparing with old version')
     .option('-d, --depth <n>', 'Relationship graph depth (default: 2)', '2')
     .option('-t, --title <title>', 'Report title')
+    .option('--complexity', 'Include complexity analysis (inheritance depth, vfunc count, coverage)')
     .action(async (filePatterns: string[], options: ReportOptions) => {
       try {
         await runReport(filePatterns, options);
@@ -129,20 +137,27 @@ async function runReport(
     );
   }
 
+  // Generate complexity analysis if requested
+  let complexityReport: ComplexityReport | null = null;
+  if (options.complexity) {
+    const allStructList = Array.from(allStructs.values()).map(s => s.struct);
+    complexityReport = analyzeComplexity(allStructList);
+  }
+
   // Generate report
   let output: string;
   const title = options.title || 'FFXIVClientStructs Documentation';
 
   switch (options.format) {
     case 'json':
-      output = generateJsonReport(filteredStructs, allEnums, changelog, options);
+      output = generateJsonReport(filteredStructs, allEnums, changelog, complexityReport, options);
       break;
     case 'html':
-      output = generateHtmlReport(filteredStructs, allEnums, changelog, title, options);
+      output = generateHtmlReport(filteredStructs, allEnums, changelog, complexityReport, title, options);
       break;
     case 'markdown':
     default:
-      output = generateMarkdownReport(filteredStructs, allEnums, changelog, title, options);
+      output = generateMarkdownReport(filteredStructs, allEnums, changelog, complexityReport, title, options);
       break;
   }
 
@@ -218,6 +233,7 @@ function generateMarkdownReport(
   structs: StructInfo[],
   enums: Map<string, { enum: YamlEnum; file: string }>,
   changelog: DiffResult | null,
+  complexityReport: ComplexityReport | null,
   title: string,
   options: ReportOptions
 ): string {
@@ -231,6 +247,10 @@ function generateMarkdownReport(
   // Table of contents
   lines.push('## Table of Contents');
   lines.push('');
+
+  if (complexityReport) {
+    lines.push('- [Complexity Analysis](#complexity-analysis)');
+  }
 
   if (changelog) {
     lines.push('- [Changelog](#changelog)');
@@ -251,6 +271,13 @@ function generateMarkdownReport(
   lines.push(`- **Structs**: ${structs.length}`);
   lines.push(`- **Enums**: ${enums.size}`);
   lines.push('');
+
+  // Complexity Analysis
+  if (complexityReport) {
+    lines.push('## Complexity Analysis');
+    lines.push('');
+    lines.push(generateComplexityMarkdown(complexityReport));
+  }
 
   // Changelog
   if (changelog) {
@@ -592,15 +619,90 @@ function sanitizeMermaidId(id: string): string {
   return id.replace(/[^a-zA-Z0-9]/g, '_');
 }
 
+function generateComplexityMarkdown(report: ComplexityReport): string {
+  const lines: string[] = [];
+
+  // Stats summary
+  lines.push('### Statistics');
+  lines.push('');
+  lines.push(`- **Total Structs**: ${report.stats.totalStructs}`);
+  lines.push(`- **Total Virtual Functions**: ${report.stats.totalVFuncs}`);
+  lines.push(`- **Average Inheritance Depth**: ${report.stats.avgInheritanceDepth}`);
+  lines.push(`- **Maximum Inheritance Depth**: ${report.stats.maxInheritanceDepth}`);
+  lines.push(`- **Average Field Coverage**: ${report.stats.avgFieldCoverage}%`);
+  lines.push(`- **Average Complexity Score**: ${report.stats.avgComplexityScore}`);
+  lines.push('');
+
+  // Most complex structs table
+  lines.push('### Most Complex Structs');
+  lines.push('');
+  lines.push(formatComplexityTable(report.structs, 15));
+  lines.push('');
+
+  // Inheritance trees
+  if (report.inheritanceTrees.length > 0) {
+    lines.push('### Inheritance Hierarchies');
+    lines.push('');
+
+    // Show top 5 largest trees
+    for (const tree of report.inheritanceTrees.slice(0, 5)) {
+      lines.push(`#### ${tree.root} (${tree.totalStructs} structs, depth ${tree.maxDepth})`);
+      lines.push('');
+      lines.push('```mermaid');
+      lines.push(generateInheritanceMermaid(tree));
+      lines.push('```');
+      lines.push('');
+    }
+  }
+
+  // Cross-reference analysis
+  lines.push('### Cross-Reference Analysis');
+  lines.push('');
+
+  if (report.crossRefs.mostReferenced.length > 0) {
+    lines.push('**Most Referenced Structs:**');
+    lines.push('');
+    for (const ref of report.crossRefs.mostReferenced.slice(0, 10)) {
+      lines.push(`- \`${ref.type}\` (${ref.count} references)`);
+    }
+    lines.push('');
+  }
+
+  if (report.crossRefs.orphans.length > 0) {
+    lines.push('**Orphan Structs (no incoming references):**');
+    lines.push('');
+    const orphanList = report.crossRefs.orphans.slice(0, 20);
+    for (const orphan of orphanList) {
+      lines.push(`- \`${orphan}\``);
+    }
+    if (report.crossRefs.orphans.length > 20) {
+      lines.push(`- *... and ${report.crossRefs.orphans.length - 20} more*`);
+    }
+    lines.push('');
+  }
+
+  if (report.crossRefs.circularRefs.length > 0) {
+    lines.push('**Circular References Detected:**');
+    lines.push('');
+    for (const cycle of report.crossRefs.circularRefs.slice(0, 10)) {
+      lines.push(`- ${cycle.map(c => `\`${c}\``).join(' ↔ ')}`);
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
 function generateHtmlReport(
   structs: StructInfo[],
   enums: Map<string, { enum: YamlEnum; file: string }>,
   changelog: DiffResult | null,
+  complexityReport: ComplexityReport | null,
   title: string,
   options: ReportOptions
 ): string {
   // Generate markdown first, then wrap in HTML
-  const markdown = generateMarkdownReport(structs, enums, changelog, title, options);
+  const markdown = generateMarkdownReport(structs, enums, changelog, complexityReport, title, options);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -673,6 +775,7 @@ function generateJsonReport(
   structs: StructInfo[],
   enums: Map<string, { enum: YamlEnum; file: string }>,
   changelog: DiffResult | null,
+  complexityReport: ComplexityReport | null,
   options: ReportOptions
 ): string {
   const report = {
@@ -694,6 +797,12 @@ function generateJsonReport(
     changelog: changelog ? {
       structs: changelog.structs,
       enums: changelog.enums,
+    } : null,
+    complexity: complexityReport ? {
+      stats: complexityReport.stats,
+      topComplex: complexityReport.structs.slice(0, 20),
+      inheritanceTrees: complexityReport.inheritanceTrees.slice(0, 10),
+      crossRefs: complexityReport.crossRefs,
     } : null,
   };
 

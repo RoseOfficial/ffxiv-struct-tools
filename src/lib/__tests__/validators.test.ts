@@ -12,6 +12,12 @@ import {
   validatePointerAlignment,
   validateSizeFieldMismatch,
   validateNamingConvention,
+  validateVTableAtZero,
+  validateKnownTypeSize,
+  validateFieldCoverage,
+  validateLargeGaps,
+  validateInheritanceSize,
+  validateCommonPatterns,
 } from '../validators.js';
 import type { YamlStruct, YamlEnum } from '../types.js';
 
@@ -470,5 +476,212 @@ describe('validateNamingConvention', () => {
     };
     const issues = validateNamingConvention(struct, strictContext);
     expect(issues).toHaveLength(0);
+  });
+});
+
+// ============================================================================
+// FFXIV-Specific Validators
+// ============================================================================
+
+describe('validateVTableAtZero', () => {
+  it('should pass when struct has no vfuncs', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'int', offset: 0 }],
+    };
+    const issues = validateVTableAtZero(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass when struct has base class', () => {
+    const struct: YamlStruct = {
+      type: 'DerivedStruct',
+      size: 16,
+      base: 'BaseStruct',
+      vfuncs: [{ name: 'VFunc1', id: 0 }],
+      fields: [{ type: 'int', offset: 0 }],
+    };
+    const issues = validateVTableAtZero(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass when first field is pointer-sized', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      vfuncs: [{ name: 'VFunc1', id: 0 }],
+      fields: [{ type: 'void*', offset: 0 }],
+    };
+    const issues = validateVTableAtZero(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should warn when first field is smaller than vtable pointer', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      vfuncs: [{ name: 'VFunc1', id: 0 }],
+      fields: [{ type: 'int', offset: 0 }],
+    };
+    const issues = validateVTableAtZero(struct, defaultContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('warning');
+    expect(issues[0].rule).toBe('vtable-at-zero');
+  });
+});
+
+describe('validateFieldCoverage', () => {
+  it('should pass when struct has no fields', () => {
+    const struct: YamlStruct = { type: 'TestStruct', size: 256 };
+    const issues = validateFieldCoverage(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass when coverage is high', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [
+        { type: 'long', offset: 0 },
+        { type: 'long', offset: 8 },
+      ],
+    };
+    const issues = validateFieldCoverage(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should info when coverage is low', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 0x100,  // 256 bytes
+      fields: [{ type: 'int', offset: 0 }],  // Only 4 bytes documented
+    };
+    const issues = validateFieldCoverage(struct, defaultContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('info');
+    expect(issues[0].rule).toBe('field-coverage');
+  });
+});
+
+describe('validateLargeGaps', () => {
+  it('should pass when no large gaps', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [
+        { type: 'int', offset: 0 },
+        { type: 'int', offset: 4 },
+        { type: 'int', offset: 8 },
+      ],
+    };
+    const issues = validateLargeGaps(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should info when large gap exists', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 0x100,
+      fields: [
+        { type: 'int', offset: 0 },
+        { type: 'int', offset: 0x50 },  // Gap of 0x4C bytes > 0x20
+      ],
+    };
+    const issues = validateLargeGaps(struct, defaultContext);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('info');
+    expect(issues[0].rule).toBe('large-gap');
+  });
+
+  it('should skip unions', () => {
+    const struct: YamlStruct = {
+      type: 'TestUnion',
+      size: 0x100,
+      union: true,
+      fields: [
+        { type: 'int', offset: 0 },
+        { type: 'int', offset: 0x50 },
+      ],
+    };
+    const issues = validateLargeGaps(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+});
+
+describe('validateInheritanceSize', () => {
+  it('should pass when no base class', () => {
+    const struct: YamlStruct = { type: 'TestStruct', size: 16 };
+    const issues = validateInheritanceSize(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass when no struct registry', () => {
+    const struct: YamlStruct = { type: 'DerivedStruct', size: 16, base: 'BaseStruct' };
+    const issues = validateInheritanceSize(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should pass when child is larger than parent', () => {
+    const context = {
+      ...defaultContext,
+      structRegistry: new Map([
+        ['BaseStruct', { type: 'BaseStruct', size: 16 } as YamlStruct],
+      ]),
+    };
+    const struct: YamlStruct = { type: 'DerivedStruct', size: 32, base: 'BaseStruct' };
+    const issues = validateInheritanceSize(struct, context);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should warn when child is smaller than parent', () => {
+    const context = {
+      ...defaultContext,
+      structRegistry: new Map([
+        ['BaseStruct', { type: 'BaseStruct', size: 32 } as YamlStruct],
+      ]),
+    };
+    const struct: YamlStruct = { type: 'DerivedStruct', size: 16, base: 'BaseStruct' };
+    const issues = validateInheritanceSize(struct, context);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].severity).toBe('warning');
+    expect(issues[0].rule).toBe('inheritance-size');
+  });
+});
+
+describe('validateCommonPatterns', () => {
+  const strictContext = {
+    ...defaultContext,
+    options: { strict: true },
+  };
+
+  it('should skip in non-strict mode', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 0x68,
+      fields: [{ type: 'byte', name: 'PlayerName', offset: 0, size: 0x68 }],
+    };
+    const issues = validateCommonPatterns(struct, defaultContext);
+    expect(issues).toHaveLength(0);
+  });
+
+  it('should suggest Utf8String for string-named fields', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 16,
+      fields: [{ type: 'byte', name: 'PlayerName', offset: 0 }],
+    };
+    const issues = validateCommonPatterns(struct, strictContext);
+    expect(issues.some(i => i.rule === 'common-pattern' && i.message.includes('string type'))).toBe(true);
+  });
+
+  it('should suggest Utf8String for 0x68-sized fields', () => {
+    const struct: YamlStruct = {
+      type: 'TestStruct',
+      size: 0x100,
+      fields: [{ type: 'byte', name: 'SomeField', offset: 0, size: 0x68 }],
+    };
+    const issues = validateCommonPatterns(struct, strictContext);
+    expect(issues.some(i => i.rule === 'common-pattern' && i.message.includes('Utf8String'))).toBe(true);
   });
 });

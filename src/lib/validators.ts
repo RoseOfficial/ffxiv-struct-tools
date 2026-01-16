@@ -14,6 +14,7 @@ import {
   toHex,
   isPointerType,
   TYPE_SIZES,
+  FFXIV_TYPE_SIZES,
   extractBaseType,
 } from './types.js';
 
@@ -26,6 +27,8 @@ interface ValidationContext {
   allStructNames: Set<string>;
   allEnumNames: Set<string>;
   options: ValidationOptions;
+  /** Map of struct name to struct definition (for cross-struct validation) */
+  structRegistry?: Map<string, YamlStruct>;
 }
 
 // ============================================================================
@@ -526,6 +529,245 @@ export function validateNamingConvention(
 }
 
 // ============================================================================
+// FFXIV-Specific Validation Rules
+// ============================================================================
+
+/**
+ * Rule: Structs with vfuncs should have space for vtable pointer at offset 0
+ * In C++, the vtable pointer is at offset 0 for polymorphic types.
+ */
+export function validateVTableAtZero(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  // Only check structs with virtual functions
+  if (!struct.vfuncs || struct.vfuncs.length === 0) return issues;
+
+  // If struct has a base class, vtable is inherited (skip check)
+  if (struct.base) return issues;
+
+  // Check if there's a field at offset 0
+  if (!struct.fields || struct.fields.length === 0) return issues;
+
+  const firstField = struct.fields.find(f => parseOffset(f.offset) === 0);
+  if (firstField) {
+    // Check if it's a pointer-sized gap or vtable marker
+    const fieldSize = estimateFieldSizeForValidation(firstField, context);
+    if (fieldSize > 0 && fieldSize < 8) {
+      issues.push({
+        severity: 'warning',
+        rule: 'vtable-at-zero',
+        message: `Struct has vfuncs but field '${firstField.name || firstField.type}' at offset 0 is only ${fieldSize} bytes (vtable pointer needs 8 bytes)`,
+        struct: struct.type,
+        field: firstField.name || firstField.type,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Validate that known FFXIV types have correct sizes
+ */
+export function validateKnownTypeSize(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.fields) return issues;
+
+  for (const field of struct.fields) {
+    const baseType = extractBaseType(field.type);
+    const expectedSize = FFXIV_TYPE_SIZES[baseType];
+
+    if (expectedSize !== undefined && field.size !== undefined) {
+      // field.size is typically array count, but for embedded structs it's the size
+      // Only warn if it looks like an embedded struct (not an array)
+      if (field.size !== expectedSize && field.size === 1) {
+        // This is likely a single instance that was given wrong size
+        issues.push({
+          severity: 'warning',
+          rule: 'known-type-size',
+          message: `Field '${field.name || field.type}' of type '${baseType}' has unexpected size (expected ${toHex(expectedSize)})`,
+          struct: struct.type,
+          field: field.name || field.type,
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Report when field coverage is low (indicates undocumented regions)
+ */
+export function validateFieldCoverage(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.fields || struct.fields.length === 0 || !struct.size) return issues;
+
+  // Calculate total documented bytes
+  let documentedBytes = 0;
+  for (const field of struct.fields) {
+    const fieldSize = estimateFieldSizeForValidation(field, context);
+    if (fieldSize > 0) {
+      documentedBytes += fieldSize;
+    }
+  }
+
+  // Calculate coverage percentage
+  const coverage = documentedBytes / struct.size;
+
+  // Only report if coverage is very low (<50%) and struct is non-trivial
+  if (coverage < 0.5 && struct.size > 0x20) {
+    issues.push({
+      severity: 'info',
+      rule: 'field-coverage',
+      message: `Only ${Math.round(coverage * 100)}% of struct size is documented (${toHex(documentedBytes)} of ${toHex(struct.size)} bytes)`,
+      struct: struct.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Detect large gaps between fields that may indicate missing documentation
+ */
+export function validateLargeGaps(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.fields || struct.fields.length < 2) return issues;
+  if (struct.union) return issues;
+
+  // Sort fields by offset
+  const sortedFields = [...struct.fields].sort(
+    (a, b) => parseOffset(a.offset) - parseOffset(b.offset)
+  );
+
+  for (let i = 0; i < sortedFields.length - 1; i++) {
+    const currentField = sortedFields[i];
+    const nextField = sortedFields[i + 1];
+
+    const currentOffset = parseOffset(currentField.offset);
+    const nextOffset = parseOffset(nextField.offset);
+    const currentSize = estimateFieldSizeForValidation(currentField, context);
+
+    if (currentSize > 0) {
+      const gap = nextOffset - (currentOffset + currentSize);
+      if (gap > 0x20) {
+        issues.push({
+          severity: 'info',
+          rule: 'large-gap',
+          message: `Large gap of ${toHex(gap)} bytes between '${currentField.name || currentField.type}' and '${nextField.name || nextField.type}'`,
+          struct: struct.type,
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Child struct size should be >= parent struct size
+ */
+export function validateInheritanceSize(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.base || !struct.size) return issues;
+
+  // Look up parent struct from registry
+  if (!context.structRegistry) return issues;
+
+  const parentStruct = context.structRegistry.get(struct.base);
+  if (!parentStruct || !parentStruct.size) return issues;
+
+  if (struct.size < parentStruct.size) {
+    issues.push({
+      severity: 'warning',
+      rule: 'inheritance-size',
+      message: `Struct size ${toHex(struct.size)} is smaller than base struct '${struct.base}' size ${toHex(parentStruct.size)}`,
+      struct: struct.type,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Suggest when field patterns match known FFXIV types
+ * This helps identify commonly mistyped or undocumented types
+ */
+export function validateCommonPatterns(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.fields) return issues;
+
+  // Only suggest in strict mode to avoid noise
+  if (!context.options.strict) return issues;
+
+  for (const field of struct.fields) {
+    const fieldName = (field.name || '').toLowerCase();
+    const fieldType = field.type.toLowerCase();
+
+    // Pattern: Fields named *string or *text that aren't Utf8String
+    if ((fieldName.includes('string') || fieldName.includes('text') || fieldName.includes('name'))
+        && !field.type.includes('Utf8String')
+        && !field.type.includes('CString')
+        && !field.type.includes('char')
+        && !field.type.endsWith('*')) {
+      issues.push({
+        severity: 'info',
+        rule: 'common-pattern',
+        message: `Field '${field.name}' might be a string type (consider Utf8String or CString)`,
+        struct: struct.type,
+        field: field.name,
+      });
+    }
+
+    // Pattern: Fields named *vector or *list that aren't StdVector
+    if ((fieldName.includes('vector') || fieldName.includes('list') || fieldName.includes('array'))
+        && !field.type.includes('StdVector')
+        && !field.type.includes('FixedArray')
+        && !field.type.includes('[')) {
+      issues.push({
+        severity: 'info',
+        rule: 'common-pattern',
+        message: `Field '${field.name}' might be a container type (consider StdVector)`,
+        struct: struct.type,
+        field: field.name,
+      });
+    }
+
+    // Pattern: 0x68-sized fields that might be Utf8String
+    if (field.size === 0x68 && !field.type.includes('Utf8String')) {
+      issues.push({
+        severity: 'info',
+        rule: 'common-pattern',
+        message: `Field '${field.name || field.type}' is 0x68 bytes - might be Utf8String`,
+        struct: struct.type,
+        field: field.name || field.type,
+      });
+    }
+  }
+
+  return issues;
+}
+
+// ============================================================================
 // Enum Validation Rules
 // ============================================================================
 
@@ -601,6 +843,13 @@ const STRUCT_VALIDATORS: ValidatorFn[] = [
   validatePointerAlignment,
   validateSizeFieldMismatch,
   validateNamingConvention,
+  // FFXIV-specific validators
+  validateVTableAtZero,
+  validateKnownTypeSize,
+  validateFieldCoverage,
+  validateLargeGaps,
+  validateInheritanceSize,
+  validateCommonPatterns,
 ];
 
 /**
