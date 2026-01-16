@@ -1216,6 +1216,9 @@ export function diffWithSuggestions(
   cascadingPatterns: CascadingPattern[];
   crossHierarchyPatterns: CrossHierarchyPattern[];
   patchSuggestions: PatchSuggestion[];
+  fieldInsertions: FieldInsertionPattern[];
+  enumShifts: EnumShiftPattern[];
+  funcAddressShifts: FuncAddressShiftPattern[];
 } {
   const result = diff(oldStructs, newStructs, oldEnums, newEnums);
 
@@ -1229,11 +1232,341 @@ export function diffWithSuggestions(
     crossHierarchyPatterns
   );
 
+  // Additional pattern detection
+  const fieldInsertions = detectFieldInsertions(oldStructs, newStructs, result.structs);
+  const enumShifts = detectEnumShifts(result.enums);
+  const funcAddressShifts = detectFuncAddressShifts(result.structs);
+
   return {
     result,
     hierarchyDeltas,
     cascadingPatterns,
     crossHierarchyPatterns,
     patchSuggestions,
+    fieldInsertions,
+    enumShifts,
+    funcAddressShifts,
   };
+}
+
+// ============================================================================
+// Enhanced Pattern Detection
+// ============================================================================
+
+export interface FieldInsertionPattern {
+  /** The struct where a field was inserted */
+  structName: string;
+  /** Approximate offset where insertion occurred */
+  insertionOffset: number;
+  /** Size of the inserted field */
+  insertionSize: number;
+  /** Suggested field type based on size */
+  suggestedType: string;
+  /** Affected child structs with cascading offset shifts */
+  affectedChildren: string[];
+  /** Confidence score (0-1) */
+  confidence: number;
+  /** Description of the pattern */
+  description: string;
+}
+
+/**
+ * Detect field insertion patterns
+ * When a new field is inserted into a base class, all derived classes
+ * will have their fields shifted by the size of the inserted field
+ */
+export function detectFieldInsertions(
+  oldStructs: YamlStruct[],
+  newStructs: YamlStruct[],
+  structDiffs: StructDiff[]
+): FieldInsertionPattern[] {
+  const patterns: FieldInsertionPattern[] = [];
+  const oldMap = new Map(oldStructs.map(s => [s.type, s]));
+  const newMap = new Map(newStructs.map(s => [s.type, s]));
+
+  // Find structs with size increases
+  for (const diff of structDiffs) {
+    if (diff.type !== 'modified') continue;
+    if (!diff.oldSize || !diff.newSize) continue;
+    if (diff.newSize <= diff.oldSize) continue;
+
+    const sizeDelta = diff.newSize - diff.oldSize;
+    const oldStruct = oldMap.get(diff.structName);
+    const newStruct = newMap.get(diff.structName);
+
+    if (!oldStruct || !newStruct) continue;
+
+    // Find added fields
+    const addedFields = diff.fieldChanges.filter(fc => fc.type === 'added');
+    if (addedFields.length === 0) continue;
+
+    // Find the lowest offset of added fields
+    const lowestAddedOffset = Math.min(
+      ...addedFields
+        .filter(fc => fc.newOffset !== undefined)
+        .map(fc => fc.newOffset!)
+    );
+
+    // Find children of this struct that also have shifted offsets
+    const affectedChildren: string[] = [];
+    for (const childDiff of structDiffs) {
+      if (childDiff.type !== 'modified') continue;
+      const childOld = oldMap.get(childDiff.structName);
+      if (!childOld || childOld.base !== diff.structName) continue;
+
+      // Check if child has fields shifted by the same delta
+      const shiftedFields = childDiff.fieldChanges.filter(fc => {
+        if (fc.type !== 'modified') return false;
+        if (fc.oldOffset === undefined || fc.newOffset === undefined) return false;
+        const delta = fc.newOffset - fc.oldOffset;
+        return delta === sizeDelta && fc.oldOffset >= lowestAddedOffset;
+      });
+
+      if (shiftedFields.length > 0) {
+        affectedChildren.push(childDiff.structName);
+      }
+    }
+
+    // Suggest field type based on insertion size
+    const suggestedType = suggestTypeFromSize(sizeDelta);
+
+    // Calculate confidence based on evidence
+    let confidence = 0.5; // Base confidence for detected size increase with added field
+    if (affectedChildren.length > 0) confidence += 0.2;
+    if (addedFields.length === 1) confidence += 0.1; // Single field insertion is cleaner
+    if (suggestedType !== 'unknown') confidence += 0.1;
+
+    patterns.push({
+      structName: diff.structName,
+      insertionOffset: lowestAddedOffset,
+      insertionSize: sizeDelta,
+      suggestedType,
+      affectedChildren,
+      confidence: Math.min(1, confidence),
+      description: `Field insertion of ${toHex(sizeDelta)} bytes at ${toHex(lowestAddedOffset)} in ${diff.structName}` +
+        (affectedChildren.length > 0 ? ` (affects ${affectedChildren.length} child struct(s))` : ''),
+    });
+  }
+
+  // Sort by confidence
+  patterns.sort((a, b) => b.confidence - a.confidence);
+  return patterns;
+}
+
+/**
+ * Suggest a field type based on its size
+ */
+function suggestTypeFromSize(size: number): string {
+  const sizeToType: Record<number, string> = {
+    1: 'byte',
+    2: 'short',
+    4: 'int/float',
+    8: 'long/pointer',
+    0x10: 'Vector4/Quaternion',
+    0x18: 'StdVector',
+    0x20: 'StdString',
+    0x68: 'Utf8String',
+  };
+  return sizeToType[size] || `unknown (${toHex(size)} bytes)`;
+}
+
+export interface EnumShiftPattern {
+  /** The enum with shifted values */
+  enumName: string;
+  /** The shift delta (positive = values increased) */
+  delta: number;
+  /** Number of values that shifted by this delta */
+  matchCount: number;
+  /** Total number of modified values */
+  totalModified: number;
+  /** Values that match the pattern */
+  matchingValues: { name: string; oldValue: number; newValue: number }[];
+  /** Values that don't match (potential new insertions or removals) */
+  anomalies: { name: string; oldValue?: number; newValue?: number; type: string }[];
+  /** Confidence score (0-1) */
+  confidence: number;
+  /** Description */
+  description: string;
+}
+
+/**
+ * Detect bulk shifts in enum values
+ * Common when new values are inserted mid-enum, causing all subsequent values to shift
+ */
+export function detectEnumShifts(enumDiffs: EnumDiff[]): EnumShiftPattern[] {
+  const patterns: EnumShiftPattern[] = [];
+
+  for (const diff of enumDiffs) {
+    if (diff.type !== 'modified') continue;
+    if (diff.valueChanges.length < 2) continue;
+
+    // Collect value changes with deltas
+    const modifications = diff.valueChanges
+      .filter(vc => vc.type === 'modified')
+      .map(vc => ({
+        name: vc.name,
+        oldValue: typeof vc.oldValue === 'number' ? vc.oldValue : parseInt(vc.oldValue as string, 10),
+        newValue: typeof vc.newValue === 'number' ? vc.newValue : parseInt(vc.newValue as string, 10),
+      }))
+      .filter(m => !isNaN(m.oldValue) && !isNaN(m.newValue))
+      .map(m => ({
+        ...m,
+        delta: m.newValue - m.oldValue,
+      }));
+
+    if (modifications.length < 2) continue;
+
+    // Group by delta
+    const deltaGroups = new Map<number, typeof modifications>();
+    for (const mod of modifications) {
+      if (!deltaGroups.has(mod.delta)) {
+        deltaGroups.set(mod.delta, []);
+      }
+      deltaGroups.get(mod.delta)!.push(mod);
+    }
+
+    // Find the most common non-zero delta
+    let bestDelta = 0;
+    let bestGroup: typeof modifications = [];
+    for (const [delta, group] of deltaGroups) {
+      if (delta !== 0 && group.length > bestGroup.length) {
+        bestDelta = delta;
+        bestGroup = group;
+      }
+    }
+
+    if (bestGroup.length < 2) continue;
+
+    // Calculate anomalies (values that don't match the pattern)
+    const anomalies: EnumShiftPattern['anomalies'] = [];
+    for (const vc of diff.valueChanges) {
+      if (vc.type === 'added') {
+        anomalies.push({ name: vc.name, newValue: typeof vc.newValue === 'number' ? vc.newValue : parseInt(vc.newValue as string, 10), type: 'added' });
+      } else if (vc.type === 'removed') {
+        anomalies.push({ name: vc.name, oldValue: typeof vc.oldValue === 'number' ? vc.oldValue : parseInt(vc.oldValue as string, 10), type: 'removed' });
+      } else if (vc.type === 'modified') {
+        const mod = modifications.find(m => m.name === vc.name);
+        if (mod && mod.delta !== bestDelta) {
+          anomalies.push({ name: vc.name, oldValue: mod.oldValue, newValue: mod.newValue, type: 'different-delta' });
+        }
+      }
+    }
+
+    const confidence = Math.min(1, bestGroup.length / modifications.length * 0.8 + (bestGroup.length >= 5 ? 0.2 : 0));
+
+    patterns.push({
+      enumName: diff.enumName,
+      delta: bestDelta,
+      matchCount: bestGroup.length,
+      totalModified: modifications.length,
+      matchingValues: bestGroup.map(m => ({ name: m.name, oldValue: m.oldValue, newValue: m.newValue })),
+      anomalies,
+      confidence,
+      description: `Enum ${diff.enumName}: ${bestGroup.length} values shifted by ${bestDelta > 0 ? '+' : ''}${bestDelta}` +
+        (anomalies.length > 0 ? ` (${anomalies.length} anomalies)` : ''),
+    });
+  }
+
+  patterns.sort((a, b) => b.confidence - a.confidence);
+  return patterns;
+}
+
+export interface FuncAddressShiftPattern {
+  /** The shift delta in bytes */
+  delta: number;
+  /** Number of functions that match this delta */
+  matchCount: number;
+  /** Total function address changes */
+  totalChanges: number;
+  /** Functions that match this pattern */
+  matchingFuncs: { struct: string; func: string; oldAddr: number; newAddr: number }[];
+  /** Functions that don't match */
+  anomalies: { struct: string; func: string; oldAddr: number; newAddr: number; actualDelta: number }[];
+  /** Confidence score (0-1) */
+  confidence: number;
+  /** Description */
+  description: string;
+}
+
+/**
+ * Detect consistent function address shifts
+ * Common when game code is recompiled and functions move by a consistent delta
+ */
+export function detectFuncAddressShifts(structDiffs: StructDiff[]): FuncAddressShiftPattern[] {
+  const allAddressChanges: {
+    struct: string;
+    func: string;
+    oldAddr: number;
+    newAddr: number;
+    delta: number;
+  }[] = [];
+
+  // Collect all function address changes
+  for (const diff of structDiffs) {
+    if (diff.type !== 'modified') continue;
+
+    for (const funcChange of diff.funcChanges) {
+      if (funcChange.type !== 'modified') continue;
+      if (funcChange.oldAddress === undefined || funcChange.newAddress === undefined) continue;
+      if (funcChange.oldAddress === 0 || funcChange.newAddress === 0) continue;
+
+      const delta = funcChange.newAddress - funcChange.oldAddress;
+      if (delta !== 0) {
+        allAddressChanges.push({
+          struct: diff.structName,
+          func: funcChange.funcName,
+          oldAddr: funcChange.oldAddress,
+          newAddr: funcChange.newAddress,
+          delta,
+        });
+      }
+    }
+  }
+
+  if (allAddressChanges.length < 3) return [];
+
+  // Group by delta
+  const deltaGroups = new Map<number, typeof allAddressChanges>();
+  for (const change of allAddressChanges) {
+    if (!deltaGroups.has(change.delta)) {
+      deltaGroups.set(change.delta, []);
+    }
+    deltaGroups.get(change.delta)!.push(change);
+  }
+
+  const patterns: FuncAddressShiftPattern[] = [];
+
+  // Process each significant delta group
+  for (const [delta, group] of deltaGroups) {
+    if (group.length < 3) continue; // Need at least 3 matches to be a pattern
+
+    const others = allAddressChanges.filter(c => c.delta !== delta);
+
+    const confidence = Math.min(1, group.length / allAddressChanges.length * 0.7 + (group.length >= 10 ? 0.3 : group.length / 30));
+
+    patterns.push({
+      delta,
+      matchCount: group.length,
+      totalChanges: allAddressChanges.length,
+      matchingFuncs: group.map(g => ({
+        struct: g.struct,
+        func: g.func,
+        oldAddr: g.oldAddr,
+        newAddr: g.newAddr,
+      })),
+      anomalies: others.map(o => ({
+        struct: o.struct,
+        func: o.func,
+        oldAddr: o.oldAddr,
+        newAddr: o.newAddr,
+        actualDelta: o.delta,
+      })),
+      confidence,
+      description: `${group.length} function(s) shifted by ${delta > 0 ? '+' : ''}${toHex(delta)}` +
+        ` (${Math.round(group.length / allAddressChanges.length * 100)}% of changes)`,
+    });
+  }
+
+  patterns.sort((a, b) => b.matchCount - a.matchCount);
+  return patterns;
 }

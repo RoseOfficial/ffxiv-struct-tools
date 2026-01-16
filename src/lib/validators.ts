@@ -1043,6 +1043,245 @@ export function validateNetworkPacketAlignment(
 }
 
 // ============================================================================
+// Additional Validation Rules
+// ============================================================================
+
+/**
+ * Rule: Detect circular inheritance chains (A → B → C → A)
+ * Goes beyond simple self-inheritance to detect full cycles
+ */
+export function validateCircularInheritance(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.base || !context.structRegistry) return issues;
+
+  // Already checked self-inheritance in validateInheritanceChain
+  if (struct.base === struct.type) return issues;
+
+  // Walk the inheritance chain looking for cycles
+  const visited = new Set<string>([struct.type]);
+  let current: string | undefined = struct.base;
+  const chain: string[] = [struct.type];
+
+  while (current) {
+    chain.push(current);
+
+    if (visited.has(current)) {
+      // Found a cycle
+      const cycleStart = chain.indexOf(current);
+      const cycle = chain.slice(cycleStart);
+      issues.push({
+        severity: 'error',
+        rule: 'circular-inheritance',
+        message: `Circular inheritance detected: ${cycle.join(' → ')} → ${current}`,
+        struct: struct.type,
+      });
+      break;
+    }
+
+    visited.add(current);
+    const parentStruct = context.structRegistry.get(current);
+    if (!parentStruct) break;
+    current = parentStruct.base;
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Fields at same offset in parent and child should have compatible types
+ * Catches cases where a child redefines an inherited field with an incompatible type
+ */
+export function validateFieldTypeConsistency(
+  struct: YamlStruct,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!struct.base || !struct.fields || !context.structRegistry) return issues;
+
+  const parentStruct = context.structRegistry.get(struct.base);
+  if (!parentStruct || !parentStruct.fields) return issues;
+
+  // Build a map of parent fields by offset
+  const parentFieldsByOffset = new Map<number, YamlField>();
+  for (const field of parentStruct.fields) {
+    const offset = parseOffset(field.offset);
+    parentFieldsByOffset.set(offset, field);
+  }
+
+  // Check child fields against parent fields at same offsets
+  for (const field of struct.fields) {
+    const offset = parseOffset(field.offset);
+    const parentField = parentFieldsByOffset.get(offset);
+
+    if (parentField) {
+      const childBaseType = extractBaseType(field.type);
+      const parentBaseType = extractBaseType(parentField.type);
+
+      // Check if types are compatible
+      const compatible = areTypesCompatible(childBaseType, parentBaseType);
+      if (!compatible) {
+        issues.push({
+          severity: 'warning',
+          rule: 'field-type-consistency',
+          message: `Field '${field.name || field.type}' at ${toHex(offset)} has type '${field.type}' which may conflict with inherited field '${parentField.name || parentField.type}' of type '${parentField.type}'`,
+          struct: struct.type,
+          field: field.name || field.type,
+        });
+      }
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Check if two types are compatible for inheritance purposes
+ */
+function areTypesCompatible(typeA: string, typeB: string): boolean {
+  // Same type is always compatible
+  if (typeA === typeB) return true;
+
+  // Pointer types can be compatible with each other
+  if (isPointerType(typeA) && isPointerType(typeB)) return true;
+
+  // Void pointer is compatible with any pointer
+  if ((typeA === 'void' || typeA === 'void*') && isPointerType(typeB)) return true;
+  if ((typeB === 'void' || typeB === 'void*') && isPointerType(typeA)) return true;
+
+  // Integer types of same size are compatible
+  const sizeA = TYPE_SIZES[typeA];
+  const sizeB = TYPE_SIZES[typeB];
+  if (sizeA && sizeB && sizeA === sizeB) {
+    // Check if both are integer-like
+    const intTypes = ['byte', 'sbyte', 'short', 'ushort', 'int', 'uint', 'long', 'ulong', 'bool', 'char'];
+    if (intTypes.includes(typeA) && intTypes.includes(typeB)) return true;
+  }
+
+  // Derived types might be compatible with base types
+  // (e.g., BattleChara at offset 0 is compatible with Character at offset 0)
+  // We can't fully check this without the full inheritance tree
+
+  return false;
+}
+
+/**
+ * Rule: Enum values should fit within the underlying type range
+ */
+export function validateEnumRange(
+  enumDef: YamlEnum,
+  context: ValidationContext
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!enumDef.values) return issues;
+
+  const underlying = enumDef.underlying?.toLowerCase() || 'int';
+  const range = getUnderlyingTypeRange(underlying);
+
+  if (!range) return issues;
+
+  for (const [name, value] of Object.entries(enumDef.values)) {
+    const numValue = typeof value === 'number' ? value : parseInt(value as string, 10);
+
+    if (isNaN(numValue)) continue;
+
+    if (numValue < range.min || numValue > range.max) {
+      issues.push({
+        severity: 'error',
+        rule: 'enum-range',
+        message: `Enum value '${name}' = ${numValue} is outside valid range for underlying type '${underlying}' (${range.min} to ${range.max})`,
+        struct: enumDef.type,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * Get the valid range for an underlying type
+ */
+function getUnderlyingTypeRange(underlying: string): { min: number; max: number } | null {
+  const ranges: Record<string, { min: number; max: number }> = {
+    'byte': { min: 0, max: 255 },
+    'sbyte': { min: -128, max: 127 },
+    'short': { min: -32768, max: 32767 },
+    'ushort': { min: 0, max: 65535 },
+    'int': { min: -2147483648, max: 2147483647 },
+    'uint': { min: 0, max: 4294967295 },
+    // Note: long/ulong can exceed JavaScript's safe integer range
+    'long': { min: Number.MIN_SAFE_INTEGER, max: Number.MAX_SAFE_INTEGER },
+    'ulong': { min: 0, max: Number.MAX_SAFE_INTEGER },
+  };
+
+  return ranges[underlying] || null;
+}
+
+/**
+ * Context extension for cross-file validation
+ */
+export interface CrossFileValidationContext extends ValidationContext {
+  /** Map of struct name to source file */
+  structToFile?: Map<string, string>;
+  /** Map of enum name to source file */
+  enumToFile?: Map<string, string>;
+}
+
+/**
+ * Rule: Detect when same struct/enum is defined in multiple YAML files
+ */
+export function validateCrossFileDuplicates(
+  struct: YamlStruct,
+  context: CrossFileValidationContext,
+  sourceFile: string
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  if (!context.structToFile) return issues;
+
+  const existingFile = context.structToFile.get(struct.type);
+  if (existingFile && existingFile !== sourceFile) {
+    issues.push({
+      severity: 'error',
+      rule: 'cross-file-duplicate',
+      message: `Struct '${struct.type}' is also defined in '${existingFile}'`,
+      struct: struct.type,
+      location: sourceFile,
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Rule: Detect when same enum is defined in multiple YAML files
+ */
+export function validateEnumCrossFileDuplicates(
+  enumDef: YamlEnum,
+  context: CrossFileValidationContext,
+  sourceFile: string
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  if (!context.enumToFile) return issues;
+
+  const existingFile = context.enumToFile.get(enumDef.type);
+  if (existingFile && existingFile !== sourceFile) {
+    issues.push({
+      severity: 'error',
+      rule: 'cross-file-duplicate',
+      message: `Enum '${enumDef.type}' is also defined in '${existingFile}'`,
+      struct: enumDef.type,
+      location: sourceFile,
+    });
+  }
+
+  return issues;
+}
+
+// ============================================================================
 // Enum Validation Rules
 // ============================================================================
 
@@ -1114,6 +1353,8 @@ const STRUCT_VALIDATORS: ValidatorFn[] = [
   validateFunctionAddresses,
   validateDuplicateOffsets,
   validateInheritanceChain,
+  validateCircularInheritance,
+  validateFieldTypeConsistency,
   validateVTableConsistency,
   validatePointerAlignment,
   validateSizeFieldMismatch,
@@ -1165,7 +1406,7 @@ export function validateEnum(
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
-  const enumValidators = [validateEnumName, validateEnumValues];
+  const enumValidators = [validateEnumName, validateEnumValues, validateEnumRange];
 
   for (const validator of enumValidators) {
     const validatorIssues = validator(enumDef, context);

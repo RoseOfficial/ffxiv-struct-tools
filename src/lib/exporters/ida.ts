@@ -127,6 +127,26 @@ function exportToIda(
         }
       }
 
+      // Handle vtable if struct has virtual functions
+      if (struct.vfuncs && struct.vfuncs.length > 0) {
+        const vtableName = `${structName}_VTable`;
+        lines.push(`    # Create vtable for ${structName}`);
+        lines.push(`    vtable_handle = create_vtable("${vtableName}", [`);
+
+        // Sort vfuncs by id for proper slot ordering
+        const sortedVfuncs = [...struct.vfuncs]
+          .filter(vf => vf.id !== undefined)
+          .sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+
+        for (const vfunc of sortedVfuncs) {
+          const vfuncName = sanitizeIdentifier(vfunc.name || `vfunc_${vfunc.id}`);
+          lines.push(`        (${vfunc.id}, "${vfuncName}"),`);
+        }
+
+        lines.push(`    ])`);
+        lines.push(`    apply_vtable_to_struct("${structName}", struct_handle, "${vtableName}", vtable_handle)`);
+      }
+
       // Finalize struct in IDA 9
       lines.push(`    finalize_struct("${structName}", struct_handle, ${size})`);
       lines.push('');
@@ -365,6 +385,137 @@ function generateHelperFunctions(lines: string[]): void {
   lines.push('    if tif.create_enum(enum_data):');
   lines.push('        tif.set_named_type(None, name)');
   lines.push('    return tif');
+  lines.push('');
+
+  // VTable creation helper - dual version
+  lines.push('def create_vtable(name, vfuncs):');
+  lines.push('    """Create a vtable struct with function pointers (IDA 8/9 compatible)');
+  lines.push('    ');
+  lines.push('    Args:');
+  lines.push('        name: VTable struct name');
+  lines.push('        vfuncs: List of (slot_id, func_name) tuples');
+  lines.push('    """');
+  lines.push('    if IDA9:');
+  lines.push('        return create_vtable_ida9(name, vfuncs)');
+  lines.push('    else:');
+  lines.push('        return create_vtable_ida8(name, vfuncs)');
+  lines.push('');
+
+  // IDA 8 vtable creation
+  lines.push('def create_vtable_ida8(name, vfuncs):');
+  lines.push('    """IDA 8.x: Create vtable using ida_struct"""');
+  lines.push('    sid = ida_struct.get_struc_id(name)');
+  lines.push('    if sid == idc.BADADDR:');
+  lines.push('        sid = ida_struct.add_struc(-1, name, False)');
+  lines.push('    ');
+  lines.push('    sptr = ida_struct.get_struc(sid)');
+  lines.push('    if sptr is None:');
+  lines.push('        return {"sid": sid, "members": []}');
+  lines.push('    ');
+  lines.push('    # Add function pointers at each slot');
+  lines.push('    for slot_id, func_name in vfuncs:');
+  lines.push('        offset = slot_id * 8  # x64: each pointer is 8 bytes');
+  lines.push('        member = ida_struct.get_member(sptr, offset)');
+  lines.push('        if member:');
+  lines.push('            ida_struct.del_struc_member(sptr, offset)');
+  lines.push('        ida_struct.add_struc_member(sptr, func_name, offset, ida_bytes.FF_QWORD, None, 8)');
+  lines.push('    ');
+  lines.push('    return {"sid": sid, "members": vfuncs}');
+  lines.push('');
+
+  // IDA 9 vtable creation
+  lines.push('def create_vtable_ida9(name, vfuncs):');
+  lines.push('    """IDA 9+: Create vtable using ida_typeinf"""');
+  lines.push('    tif = ida_typeinf.tinfo_t()');
+  lines.push('    til = ida_typeinf.get_idati()');
+  lines.push('    ');
+  lines.push('    # Check if vtable type already exists');
+  lines.push('    if tif.get_named_type(til, name):');
+  lines.push('        return {"tif": tif, "udt": None, "name": name, "members": vfuncs}');
+  lines.push('    ');
+  lines.push('    # Create vtable struct type data');
+  lines.push('    udt = ida_typeinf.udt_type_data_t()');
+  lines.push('    ');
+  lines.push('    # Create function pointer type (void*)');
+  lines.push('    func_ptr_type = ida_typeinf.tinfo_t()');
+  lines.push('    void_type = ida_typeinf.tinfo_t()');
+  lines.push('    void_type.create_simple_type(ida_typeinf.BTF_VOID)');
+  lines.push('    func_ptr_type.create_ptr(void_type)');
+  lines.push('    ');
+  lines.push('    # Fill gaps and add function pointers');
+  lines.push('    max_slot = max((slot for slot, _ in vfuncs), default=0)');
+  lines.push('    slot_map = {slot: func_name for slot, func_name in vfuncs}');
+  lines.push('    ');
+  lines.push('    for slot in range(max_slot + 1):');
+  lines.push('        udm = ida_typeinf.udm_t()');
+  lines.push('        if slot in slot_map:');
+  lines.push('            udm.name = slot_map[slot]');
+  lines.push('        else:');
+  lines.push('            udm.name = f"vfunc_{slot}"');
+  lines.push('        udm.offset = slot * 8 * 8  # Convert to bits (slot * 8 bytes * 8 bits)');
+  lines.push('        udm.type = func_ptr_type');
+  lines.push('        udm.size = 64  # 8 bytes in bits');
+  lines.push('        udt.push_back(udm)');
+  lines.push('    ');
+  lines.push('    # Create and register the vtable type');
+  lines.push('    vtable_tif = ida_typeinf.tinfo_t()');
+  lines.push('    if vtable_tif.create_udt(udt, ida_typeinf.BTF_STRUCT):');
+  lines.push('        vtable_tif.set_named_type(None, name)');
+  lines.push('    ');
+  lines.push('    return {"tif": vtable_tif, "udt": udt, "name": name, "members": vfuncs}');
+  lines.push('');
+
+  // Apply vtable to struct helper
+  lines.push('def apply_vtable_to_struct(struct_name, struct_handle, vtable_name, vtable_handle):');
+  lines.push('    """Apply vtable type as first member of struct (IDA 8/9 compatible)"""');
+  lines.push('    if IDA9:');
+  lines.push('        return apply_vtable_to_struct_ida9(struct_name, struct_handle, vtable_name, vtable_handle)');
+  lines.push('    else:');
+  lines.push('        return apply_vtable_to_struct_ida8(struct_name, struct_handle, vtable_name, vtable_handle)');
+  lines.push('');
+
+  // IDA 8 apply vtable
+  lines.push('def apply_vtable_to_struct_ida8(struct_name, struct_handle, vtable_name, vtable_handle):');
+  lines.push('    """IDA 8.x: Add vtable pointer as first member"""');
+  lines.push('    sid = struct_handle["sid"]');
+  lines.push('    sptr = ida_struct.get_struc(sid)');
+  lines.push('    if sptr is None:');
+  lines.push('        return False');
+  lines.push('    ');
+  lines.push('    # Check if there is already a member at offset 0');
+  lines.push('    member = ida_struct.get_member(sptr, 0)');
+  lines.push('    if member:');
+  lines.push('        # Don\'t overwrite existing vtable pointer');
+  lines.push('        return True');
+  lines.push('    ');
+  lines.push('    # Add vtable pointer at offset 0');
+  lines.push('    ida_struct.add_struc_member(sptr, "VTable", 0, ida_bytes.FF_QWORD, None, 8)');
+  lines.push('    return True');
+  lines.push('');
+
+  // IDA 9 apply vtable
+  lines.push('def apply_vtable_to_struct_ida9(struct_name, struct_handle, vtable_name, vtable_handle):');
+  lines.push('    """IDA 9+: Add vtable pointer type as first member"""');
+  lines.push('    members = struct_handle["members"]');
+  lines.push('    ');
+  lines.push('    # Check if there is already a member at offset 0');
+  lines.push('    has_member_at_zero = any(m.get("offset", -1) == 0 for m in members)');
+  lines.push('    if has_member_at_zero:');
+  lines.push('        return True');
+  lines.push('    ');
+  lines.push('    # Insert vtable pointer at the beginning');
+  lines.push('    vtable_member = {');
+  lines.push('        "name": "VTable",');
+  lines.push('        "offset": 0,');
+  lines.push('        "size": 8,');
+  lines.push('        "total_size": 8,');
+  lines.push('        "is_array": False,');
+  lines.push('        "array_count": 1,');
+  lines.push('        "is_vtable_ptr": True,');
+  lines.push('        "vtable_name": vtable_name,');
+  lines.push('    }');
+  lines.push('    members.insert(0, vtable_member)');
+  lines.push('    return True');
   lines.push('');
   lines.push('');
 }

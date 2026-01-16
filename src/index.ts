@@ -32,6 +32,7 @@ import { createSigCommand } from './commands/sig.js';
 import { createDiscoverCommand } from './commands/discover.js';
 import { createImportCommand } from './commands/import.js';
 import { createSyncCommand } from './commands/sync.js';
+import { createSystemReportCommand } from './commands/system-report.js';
 
 program
   .name('fst')
@@ -68,6 +69,8 @@ program
   .option('-i, --ignore <rules...>', 'Ignore specific validation rules')
   .option('--sync-reclass <file>', 'Watch ReClass.NET file and sync changes')
   .option('--sync-direction <dir>', 'Sync direction: bidirectional, yaml-only, reclass-only', 'bidirectional')
+  .option('--ida-output <path>', 'Auto-export IDA script on change')
+  .option('--ida-auto-reload', 'Generate IDA reload helper script for hotkey binding')
   .action(async (patterns: string[], options: WatchOptions) => {
     // Parse debounce as number
     if (typeof options.debounce === 'string') {
@@ -230,5 +233,8 @@ program.addCommand(createImportCommand());
 
 // sync command
 program.addCommand(createSyncCommand());
+
+// system-report command
+program.addCommand(createSystemReportCommand());
 
 program.parse();
