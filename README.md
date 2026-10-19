@@ -453,4 +453,4 @@ fst validate ./FFXIVClientStructs/ida/ffxiv_structs.yml
 
 ## License
 
-MIT
+All rights reserved. See [LICENSE](LICENSE).

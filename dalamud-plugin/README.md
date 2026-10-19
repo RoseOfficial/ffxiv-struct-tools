@@ -148,4 +148,4 @@ fst compare-report ./ida/*.yml ./struct-validation.json -o ./comparison.json
 
 ## License
 
-MIT
+All rights reserved. See [LICENSE](../LICENSE).
